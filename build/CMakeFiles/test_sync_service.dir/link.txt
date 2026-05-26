@@ -1,0 +1,1 @@
+/usr/bin/c++ -g -Wl,--dependency-file=CMakeFiles/test_sync_service.dir/link.d CMakeFiles/test_sync_service.dir/test/test_sync_service.cpp.o -o test_sync_service

@@ -1,0 +1,2 @@
+/usr/bin/ar qc libheadmotion_ble.a CMakeFiles/headmotion_ble.dir/src/ble/SimpleBleAdapter.cpp.o CMakeFiles/headmotion_ble.dir/src/ble/SimpleBleInfoBoard.cpp.o CMakeFiles/headmotion_ble.dir/src/ble/MetaWearBoardAdapter.cpp.o
+/usr/bin/ranlib libheadmotion_ble.a

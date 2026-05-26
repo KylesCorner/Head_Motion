@@ -1,0 +1,7 @@
+{
+	"InstallScripts" : 
+	[
+		"/home/kyle/Collage/HeadMotion/code/smoke_test/build/cmake_install.cmake"
+	],
+	"Parallel" : false
+}

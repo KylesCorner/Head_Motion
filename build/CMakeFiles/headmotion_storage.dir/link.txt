@@ -1,0 +1,2 @@
+/usr/bin/ar qc libheadmotion_storage.a CMakeFiles/headmotion_storage.dir/src/storage/FileMetadataStore.cpp.o
+/usr/bin/ranlib libheadmotion_storage.a
