@@ -7,6 +7,8 @@
 extern "C" {
 #include "metawear/core/datasignal.h"
 #include "metawear/core/logging.h"
+#include "metawear/core/metawearboard.h"
+#include "metawear/core/module.h"
 #include "metawear/sensor/accelerometer.h"
 #include "metawear/sensor/gyro_bosch.h"
 }
@@ -23,6 +25,15 @@ extern "C" {
 namespace headmotion::app {
 
 namespace {
+
+constexpr int32_t GYRO_IMPL_BMI160 = 0;
+constexpr int32_t GYRO_IMPL_BMI270 = 1;
+
+enum class GyroImpl {
+    Unknown,
+    Bmi160,
+    Bmi270
+};
 
 struct LoggerCreateState {
     std::atomic<int> callbacks{0};
@@ -63,6 +74,93 @@ void removeStaleBoardState() {
         std::filesystem::remove(state_path);
         std::cout << "Removed stale board state: " << state_path << "\n";
     }
+}
+
+GyroImpl detectGyroImpl(MblMwMetaWearBoard* board) {
+    if (board == nullptr) {
+        throw std::runtime_error("Cannot detect gyro implementation: board is null");
+    }
+
+    const int32_t impl =
+        mbl_mw_metawearboard_lookup_module(board, MBL_MW_MODULE_GYRO);
+
+    std::cout << "Raw gyro implementation value: " << impl << "\n";
+
+    if (impl < 0) {
+        throw std::runtime_error("Gyroscope module is not present on this board");
+    }
+
+    if (impl == GYRO_IMPL_BMI160) {
+        std::cout << "Gyro implementation: BMI160\n";
+        return GyroImpl::Bmi160;
+    }
+
+    if (impl == GYRO_IMPL_BMI270) {
+        std::cout << "Gyro implementation: BMI270\n";
+        return GyroImpl::Bmi270;
+    }
+
+    throw std::runtime_error(
+        "Unknown gyroscope implementation: " + std::to_string(impl)
+    );
+}
+
+void configureGyro(
+    MblMwMetaWearBoard* board,
+    GyroImpl gyro_impl,
+    float sample_rate_hz
+) {
+    const MblMwGyroBoschOdr odr = gyroOdrFromRate(sample_rate_hz);
+
+    if (gyro_impl == GyroImpl::Bmi160) {
+        mbl_mw_gyro_bmi160_set_odr(board, odr);
+        mbl_mw_gyro_bmi160_set_range(board, MBL_MW_GYRO_BOSCH_RANGE_500dps);
+        mbl_mw_gyro_bmi160_write_config(board);
+        return;
+    }
+
+    if (gyro_impl == GyroImpl::Bmi270) {
+        mbl_mw_gyro_bmi270_set_odr(board, odr);
+        mbl_mw_gyro_bmi270_set_range(board, MBL_MW_GYRO_BOSCH_RANGE_500dps);
+        mbl_mw_gyro_bmi270_write_config(board);
+        return;
+    }
+
+    throw std::runtime_error("Cannot configure gyro: unknown implementation");
+}
+
+MblMwDataSignal* getGyroSignal(
+    MblMwMetaWearBoard* board,
+    GyroImpl gyro_impl
+) {
+    if (gyro_impl == GyroImpl::Bmi160) {
+        return mbl_mw_gyro_bmi160_get_rotation_data_signal(board);
+    }
+
+    if (gyro_impl == GyroImpl::Bmi270) {
+        return mbl_mw_gyro_bmi270_get_rotation_data_signal(board);
+    }
+
+    return nullptr;
+}
+
+void startGyro(
+    MblMwMetaWearBoard* board,
+    GyroImpl gyro_impl
+) {
+    if (gyro_impl == GyroImpl::Bmi160) {
+        mbl_mw_gyro_bmi160_enable_rotation_sampling(board);
+        mbl_mw_gyro_bmi160_start(board);
+        return;
+    }
+
+    if (gyro_impl == GyroImpl::Bmi270) {
+        mbl_mw_gyro_bmi270_enable_rotation_sampling(board);
+        mbl_mw_gyro_bmi270_start(board);
+        return;
+    }
+
+    throw std::runtime_error("Cannot start gyro: unknown implementation");
 }
 
 void onAccelLoggerCreated(void* context, MblMwDataLogger* logger) {
@@ -177,20 +275,20 @@ int runRecordStartCommand(const std::string& port_name, float sample_rate_hz) {
     mbl_mw_acc_write_acceleration_config(board);
     pumpFor(bridge, 250);
 
-    std::cout << "Configuring gyro BMI160: "
+    const GyroImpl gyro_impl = detectGyroImpl(board);
+
+    std::cout << "Configuring gyro: "
               << sample_rate_hz
               << " Hz, +/-500 dps\n";
 
-    mbl_mw_gyro_bmi160_set_odr(board, gyroOdrFromRate(sample_rate_hz));
-    mbl_mw_gyro_bmi160_set_range(board, MBL_MW_GYRO_BOSCH_RANGE_500dps);
-    mbl_mw_gyro_bmi160_write_config(board);
+    configureGyro(board, gyro_impl, sample_rate_hz);
     pumpFor(bridge, 250);
 
     MblMwDataSignal* accel_signal =
         mbl_mw_acc_get_acceleration_data_signal(board);
 
     MblMwDataSignal* gyro_signal =
-        mbl_mw_gyro_bmi160_get_rotation_data_signal(board);
+        getGyroSignal(board, gyro_impl);
 
     if (accel_signal == nullptr) {
         std::cerr << "Failed to get accelerometer data signal\n";
@@ -235,6 +333,30 @@ int runRecordStartCommand(const std::string& port_name, float sample_rate_hz) {
         return 5;
     }
 
+    if (logger_state.accel_logger == nullptr) {
+        std::cerr << "Accelerometer logger is null after successful callback\n";
+        return 5;
+    }
+
+    if (logger_state.gyro_logger == nullptr) {
+        std::cerr << "Gyro logger is null after successful callback\n";
+        return 5;
+    }
+
+    const uint8_t accel_logger_id =
+        mbl_mw_logger_get_id(logger_state.accel_logger);
+
+    const uint8_t gyro_logger_id =
+        mbl_mw_logger_get_id(logger_state.gyro_logger);
+
+    std::cout << "Accel logger ID: "
+              << static_cast<int>(accel_logger_id)
+              << "\n";
+
+    std::cout << "Gyro logger ID: "
+              << static_cast<int>(gyro_logger_id)
+              << "\n";
+
     std::cout << "Starting internal logging, overwrite=false\n";
     mbl_mw_logging_start(board, 0);
     pumpFor(bridge, 250);
@@ -245,8 +367,7 @@ int runRecordStartCommand(const std::string& port_name, float sample_rate_hz) {
     pumpFor(bridge, 250);
 
     std::cout << "Starting gyro sampling\n";
-    mbl_mw_gyro_bmi160_enable_rotation_sampling(board);
-    mbl_mw_gyro_bmi160_start(board);
+    startGyro(board, gyro_impl);
     pumpFor(bridge, 250);
 
     const auto board_state = bridge.serializeBoard();
