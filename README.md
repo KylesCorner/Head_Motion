@@ -124,6 +124,7 @@ Command Table:
 | `record-start` | `mmsctl record-start <serial-port> [--rate 25\|50\|100]` | `<serial-port>`: serial device path. `--rate`: optional sample rate in Hz; supported values are `25`, `50`, and `100`. Defaults to `50`                                   |
 | `record-stop`  | `mmsctl record-stop <serial-port>`                       | `<serial-port>`: serial device path. Planned command for stopping accel/gyro sampling and internal logging                                                                |
 | `sync`         | `mmsctl sync <serial-port> --out <output-dir>`           | `<serial-port>`: serial device path. `--out <output-dir>`: directory where downloaded recording files should be saved. Planned command for downloading logged sensor data |
+| `battery` | `mmsctl battery <serial-port>` |`<serial-port>`: serial device path|
 
 General command format:
 
@@ -144,11 +145,13 @@ The intended recording workflow is:
 ```bash
 ./build/linux-native-debug/mmsctl scan
 ./build/linux-native-debug/mmsctl record-reset /dev/ttyACM0
+./build/linux-native-debug/mmsctl battery /dev/ttyACM0
 ./build/linux-native-debug/mmsctl record-start /dev/ttyACM0 --rate 50
 
 # Wear or move the sensor while it records internally.
 
 ./build/linux-native-debug/mmsctl record-stop /dev/ttyACM0
+./build/linux-native-debug/mmsctl battery /dev/ttyACM0
 ./build/linux-native-debug/mmsctl sync /dev/ttyACM0 --out data/session_001
 ```
 

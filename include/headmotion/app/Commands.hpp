@@ -14,4 +14,5 @@ int runRecordStartCommand(const std::string& port_name, float sample_rate_hz);
 int runRecordStopCommand(const std::string& port_name);
 int runSyncCommand(const std::string& port_name, const std::string& output_path);
 int runRecordResetCommand(const std::string& port_name);
+int runBatteryCommand(const std::string& port_name);
 } // namespace headmotion::app

@@ -19,6 +19,7 @@ void printUsage(const char* argv0) {
         << "  " << argv0 << " record-stop <serial-port>\n"
         << "  " << argv0 << " sync <serial-port> [--out path]\n"
         << "  " << argv0 << " record-reset <serial-port>\n"
+        << "  " << argv0 << " battery <serial-port>\n"
         << "\n"
         << "Examples:\n"
         << "  " << argv0 << " scan\n"
@@ -30,7 +31,8 @@ void printUsage(const char* argv0) {
         << "  " << argv0 << " record-start /dev/ttyACM0 --rate 50\n"
         << "  " << argv0 << " record-stop /dev/ttyACM0\n"
         << "  " << argv0 << " sync /dev/ttyACM0 --out data/sync.csv\n"
-        << "  " << argv0 << " record-reset /dev/ttyACM0\n";
+        << "  " << argv0 << " record-reset /dev/ttyACM0\n"
+        << "  " << argv0 << " battery /dev/ttyACM0\n";
 }
 
 } // namespace
@@ -159,6 +161,14 @@ int main(int argc, char** argv) {
             }
 
             return headmotion::app::runSyncCommand(argv[2], output_path);
+        }
+        if (command == "battery") {
+            if (argc != 3) {
+                printUsage(argv[0]);
+                return 1;
+            }
+
+            return headmotion::app::runBatteryCommand(argv[2]);
         }
 
         std::cerr << "Unknown command: " << command << "\n";
