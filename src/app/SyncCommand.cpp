@@ -149,14 +149,14 @@ void onProgressUpdate(void* context, std::uint32_t entries_left, std::uint32_t t
     state->entries_left = entries_left;
     state->total_entries = total_entries;
 
-    std::cout << "Download progress: "
-              << (total_entries - entries_left)
-              << "/"
-              << total_entries
-              << " entries"
-              << " left="
-              << entries_left
-              << "\n";
+    // std::cout << "Download progress: "
+    //           << (total_entries - entries_left)
+    //           << "/"
+    //           << total_entries
+    //           << " entries"
+    //           << " left="
+    //           << entries_left
+    //           << "\n";
 
     if (entries_left == 0) {
         state->download_done = true;
@@ -295,18 +295,18 @@ int runSyncCommand(const std::string& port_name, const std::string& output_path)
     download_handler.received_unknown_entry = onUnknownEntry;
 
     std::cout << "Starting log download\n";
-    mbl_mw_logging_download(board, 20, &download_handler);
+    mbl_mw_logging_download(board, 255, &download_handler);
 
     const auto deadline = std::chrono::steady_clock::now() + 60s;
 
     while (std::chrono::steady_clock::now() < deadline) {
-        bridge.pumpOnce(100);
+        bridge.pumpOnce(10);
 
         if (sync_state.download_done.load()) {
             break;
         }
 
-        std::this_thread::sleep_for(10ms);
+        std::this_thread::sleep_for(1ms);
     }
 
     sync_state.csv.flush();

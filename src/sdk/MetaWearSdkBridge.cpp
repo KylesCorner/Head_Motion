@@ -84,9 +84,9 @@ void MetaWearSdkBridge::pumpOnce(int timeout_ms) {
     const auto frames = usb_.readFrames(std::chrono::milliseconds(timeout_ms));
 
     for (const auto& frame : frames) {
-        std::cout << "SDK bridge RX payload: "
-                  << headmotion::util::hexDump(frame.payload)
-                  << "\n";
+        // std::cout << "SDK bridge RX payload: "
+        //           << headmotion::util::hexDump(frame.payload)
+        //           << "\n";
 
         feedNotificationPayload(frame.payload);
     }
@@ -112,11 +112,11 @@ void MetaWearSdkBridge::handleWriteGattChar(
 
     const std::vector<std::uint8_t> payload(value, value + length);
 
-    std::cout << "SDK write_gatt_char TX payload ["
-              << payload.size()
-              << " bytes]: "
-              << headmotion::util::hexDump(payload)
-              << "\n";
+    // std::cout << "SDK write_gatt_char TX payload ["
+    //           << payload.size()
+    //           << " bytes]: "
+    //           << headmotion::util::hexDump(payload)
+    //           << "\n";
 
     usb_.writePayload(payload);
 

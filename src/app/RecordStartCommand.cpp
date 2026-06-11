@@ -46,8 +46,13 @@ struct LoggerCreateState {
 void validateSampleRate(float sample_rate_hz) {
     if (sample_rate_hz != 25.0f &&
         sample_rate_hz != 50.0f &&
-        sample_rate_hz != 100.0f) {
-        throw std::runtime_error("Unsupported sample rate. Use one of: 25, 50, 100 Hz");
+        sample_rate_hz != 100.0f &&
+        sample_rate_hz != 200.0f &&
+        sample_rate_hz != 400.0f &&
+        sample_rate_hz != 800.0f &&
+        sample_rate_hz != 1600.0f &&
+        sample_rate_hz != 3200.0f) {
+        throw std::runtime_error("Unsupported sample rate. Use one of: 25, 50, 100, 200, 400, 800, 1600, 3200 Hz");
     }
 }
 
@@ -64,7 +69,27 @@ MblMwGyroBoschOdr gyroOdrFromRate(float sample_rate_hz) {
         return MBL_MW_GYRO_BOSCH_ODR_100Hz;
     }
 
-    throw std::runtime_error("Unsupported sample rate. Use one of: 25, 50, 100 Hz");
+    if(sample_rate_hz == 200.0f) {
+        return MBL_MW_GYRO_BOSCH_ODR_200Hz;
+    }
+
+    if(sample_rate_hz == 400.0f) {
+        return MBL_MW_GYRO_BOSCH_ODR_400Hz;
+    }
+
+    if(sample_rate_hz == 800.0f) {
+        return MBL_MW_GYRO_BOSCH_ODR_800Hz;
+    }
+
+    if(sample_rate_hz == 1600.0f) {
+        return MBL_MW_GYRO_BOSCH_ODR_1600Hz;
+    }
+
+    if(sample_rate_hz == 3200.0f) {
+        return MBL_MW_GYRO_BOSCH_ODR_3200Hz;
+    }
+
+    throw std::runtime_error("Unsupported sample rate. Use one of: 25, 50, 100, 200, 400, 800, 1600, 3200 Hz");
 }
 
 void removeStaleBoardState() {
