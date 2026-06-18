@@ -5,8 +5,11 @@
 #include "headmotion/transport/SerialPortFactory.hpp"
 
 extern "C" {
+#include "metawear/core/debug.h"
 #include "metawear/core/logging.h"
+#include "metawear/core/macro.h"
 #include "metawear/core/metawearboard.h"
+#include "metawear/core/module.h"
 #include "metawear/sensor/accelerometer.h"
 #include "metawear/sensor/gyro_bosch.h"
 }
@@ -21,6 +24,15 @@ namespace headmotion::app {
 
 namespace {
 
+constexpr int32_t GYRO_IMPL_BMI160 = 0;
+constexpr int32_t GYRO_IMPL_BMI270 = 1;
+
+std::filesystem::path loggerMetadataPath() {
+    return std::filesystem::path(
+        headmotion::session::BoardStateStore::defaultPath() + ".loggers"
+    );
+}
+
 void pumpFor(headmotion::sdk::MetaWearSdkBridge& bridge, int total_ms) {
     const auto deadline =
         std::chrono::steady_clock::now() + std::chrono::milliseconds(total_ms);
@@ -31,17 +43,69 @@ void pumpFor(headmotion::sdk::MetaWearSdkBridge& bridge, int total_ms) {
     }
 }
 
-} // namespace
-
-int runRecordResetCommand(const std::string& port_name) {
-    using namespace std::chrono_literals;
-
+void removeLocalStateFiles() {
     const auto state_path = headmotion::session::BoardStateStore::defaultPath();
 
     if (std::filesystem::exists(state_path)) {
         std::filesystem::remove(state_path);
         std::cout << "Removed stale board state: " << state_path << "\n";
     }
+
+    const auto metadata_path = loggerMetadataPath();
+
+    if (std::filesystem::exists(metadata_path)) {
+        std::filesystem::remove(metadata_path);
+        std::cout << "Removed stale logger metadata: " << metadata_path << "\n";
+    }
+}
+
+void stopGyroIfPresent(
+    headmotion::sdk::MetaWearSdkBridge& bridge,
+    MblMwMetaWearBoard* board
+) {
+    const int32_t impl =
+        mbl_mw_metawearboard_lookup_module(board, MBL_MW_MODULE_GYRO);
+
+    if (impl < 0) {
+        std::cout << "Gyro module not present; skipping gyro stop\n";
+        return;
+    }
+
+    std::cout << "Raw gyro implementation value: " << impl << "\n";
+
+    if (impl == GYRO_IMPL_BMI160) {
+        std::cout << "Stopping BMI160 gyro sampling\n";
+        mbl_mw_gyro_bmi160_stop(board);
+        pumpFor(bridge, 150);
+
+        std::cout << "Disabling BMI160 gyro rotation sampling\n";
+        mbl_mw_gyro_bmi160_disable_rotation_sampling(board);
+        pumpFor(bridge, 150);
+        return;
+    }
+
+    if (impl == GYRO_IMPL_BMI270) {
+        std::cout << "Stopping BMI270 gyro sampling\n";
+        mbl_mw_gyro_bmi270_stop(board);
+        pumpFor(bridge, 150);
+
+        std::cout << "Disabling BMI270 gyro rotation sampling\n";
+        mbl_mw_gyro_bmi270_disable_rotation_sampling(board);
+        pumpFor(bridge, 150);
+        return;
+    }
+
+    std::cout << "Unknown gyro implementation "
+              << impl
+              << "; skipping explicit gyro stop\n";
+}
+
+} // namespace
+
+int runRecordResetCommand(const std::string& port_name) {
+    using namespace std::chrono_literals;
+
+    removeLocalStateFiles();
 
     headmotion::transport::SerialConfig config;
     config.port_name = port_name;
@@ -70,13 +134,7 @@ int runRecordResetCommand(const std::string& port_name) {
 
     auto* board = bridge.board();
 
-    std::cout << "Stopping gyro sampling\n";
-    mbl_mw_gyro_bmi160_stop(board);
-    pumpFor(bridge, 150);
-
-    std::cout << "Disabling gyro rotation sampling\n";
-    mbl_mw_gyro_bmi160_disable_rotation_sampling(board);
-    pumpFor(bridge, 150);
+    stopGyroIfPresent(bridge, board);
 
     std::cout << "Stopping accelerometer sampling\n";
     mbl_mw_acc_stop(board);
@@ -88,19 +146,28 @@ int runRecordResetCommand(const std::string& port_name) {
 
     std::cout << "Stopping internal logging\n";
     mbl_mw_logging_stop(board);
-    pumpFor(bridge, 250);
+    pumpFor(bridge, 500);
 
     std::cout << "Clearing logged entries\n";
     mbl_mw_logging_clear_entries(board);
+    pumpFor(bridge, 1500);
+
+    std::cout << "Tearing down board routes/loggers/events/timers\n";
+    mbl_mw_metawearboard_tear_down(board);
+    pumpFor(bridge, 1500);
+
+    std::cout << "Erasing macros\n";
+    mbl_mw_macro_erase_all(board);
     pumpFor(bridge, 500);
 
-    std::cout << "Tearing down board routes/loggers/events\n";
-    mbl_mw_metawearboard_tear_down(board);
-    pumpFor(bridge, 1000);
+    std::cout << "Resetting board after garbage collection\n";
+    std::cout << "The USB serial device may disconnect/reconnect now.\n";
+    mbl_mw_debug_reset_after_gc(board);
+
+    pumpFor(bridge, 3000);
 
     std::cout << "Record reset complete.\n";
-    std::cout << "Board logger routes should now be cleared.\n";
-    std::cout << "You can now run record-start again.\n";
+    std::cout << "Wait a few seconds for /dev/ttyACM0 to reappear, then run record-start.\n";
 
     return 0;
 }

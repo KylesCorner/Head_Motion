@@ -325,7 +325,6 @@ add_library(headmotion_app
     src/app/RecordStopCommand.cpp
     src/app/RecordResetCommand.cpp
     src/app/SyncCommand.cpp
-    src/app/BatteryCommand.cpp
 )
 
 target_include_directories(headmotion_app PUBLIC

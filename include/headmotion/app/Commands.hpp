@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstdint>
 #include <string>
 
 namespace headmotion::app {
@@ -10,9 +11,15 @@ int runRawTxCommand(const std::string& port_name, const std::string& hex_string)
 int runCommandPayloadCommand(const std::string& port_name, const std::string& payload_hex);
 int runModuleInfoCommand(const std::string& port_name);
 int runSdkProbeCommand(const std::string& port_name);
-int runRecordStartCommand(const std::string& port_name, float sample_rate_hz);
-int runRecordStopCommand(const std::string& port_name);
+
+int runRecordStartCommand(
+    const std::string& port_name,
+    float sample_rate_hz,
+    std::uint32_t battery_interval_seconds
+);
+
 int runSyncCommand(const std::string& port_name, const std::string& output_path);
+int runRecordStopCommand(const std::string& port_name);
 int runRecordResetCommand(const std::string& port_name);
-int runBatteryCommand(const std::string& port_name);
+
 } // namespace headmotion::app

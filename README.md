@@ -108,23 +108,22 @@ sudo usermod -aG dialout "$USER"
 ```
 
 Log out and log back in after changing group membership.
-
 ## Usage
 
 Command Table:
 
-| Command | Usage                                                    | Arguments|
-| -------------- | -------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `scan`         | `mmsctl scan`                                            | None                                                                                                                                                                      |
-| `identify`     | `mmsctl identify <serial-port>`                          | `<serial-port>`: serial device path, for example `/dev/ttyACM0`                                                                                                           |
-| `tx-raw`       | `mmsctl tx-raw <serial-port> <hex-bytes>`                | `<serial-port>`: serial device path. `<hex-bytes>`: full raw USB frame bytes, for example `"1F 02 01 80 0A"`                                                              |
-| `cmd`          | `mmsctl cmd <serial-port> <payload-hex>`                 | `<serial-port>`: serial device path. `<payload-hex>`: MetaWear command payload only; the app wraps it in the USB frame format, for example `"01 80"`                      |
-| `module-info`  | `mmsctl module-info <serial-port>`                       | `<serial-port>`: serial device path                                                                                                                                       |
-| `sdk-probe`    | `mmsctl sdk-probe <serial-port>`                         | `<serial-port>`: serial device path                                                                                                                                       |
-| `record-start` | `mmsctl record-start <serial-port> [--rate 25\|50\|100]` | `<serial-port>`: serial device path. `--rate`: optional sample rate in Hz; supported values are `25`, `50`, and `100`. Defaults to `50`                                   |
-| `record-stop`  | `mmsctl record-stop <serial-port>`                       | `<serial-port>`: serial device path. Planned command for stopping accel/gyro sampling and internal logging                                                                |
-| `sync`         | `mmsctl sync <serial-port> --out <output-dir>`           | `<serial-port>`: serial device path. `--out <output-dir>`: directory where downloaded recording files should be saved. Planned command for downloading logged sensor data |
-| `battery` | `mmsctl battery <serial-port>` |`<serial-port>`: serial device path|
+| Command        | Usage                                                                                                            | Arguments                                                                                                                                                                                                           |
+| -------------- | ---------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `scan`         | `mmsctl scan`                                                                                                    | None                                                                                                                                                                                                                |
+| `identify`     | `mmsctl identify <serial-port>`                                                                                  | `<serial-port>`: serial device path, for example `/dev/ttyACM0`                                                                                                                                                     |
+| `tx-raw`       | `mmsctl tx-raw <serial-port> <hex-bytes>`                                                                        | `<serial-port>`: serial device path. `<hex-bytes>`: full raw USB frame bytes, for example `"1F 02 01 80 0A"`                                                                                                        |
+| `cmd`          | `mmsctl cmd <serial-port> <payload-hex>`                                                                         | `<serial-port>`: serial device path. `<payload-hex>`: MetaWear command payload only; the app wraps it in the USB frame format, for example `"01 80"`                                                                |
+| `module-info`  | `mmsctl module-info <serial-port>`                                                                               | `<serial-port>`: serial device path                                                                                                                                                                                 |
+| `sdk-probe`    | `mmsctl sdk-probe <serial-port>`                                                                                 | `<serial-port>`: serial device path                                                                                                                                                                                 |
+| `record-reset` | `mmsctl record-reset <serial-port>`                                                                              | `<serial-port>`: serial device path. Clears existing onboard logging/routes so a fresh recording session can be configured                                                                                          |
+| `record-start` | `mmsctl record-start <serial-port> [--rate 25\|50\|100\|200\|400\|800\|1600\|3200] [--battery-interval seconds]` | `<serial-port>`: serial device path. `--rate`: optional accel/gyro sample rate in Hz; defaults to `50`. `--battery-interval`: optional battery logging interval in seconds. If omitted, battery logging is disabled |
+| `record-stop`  | `mmsctl record-stop <serial-port>`                                                                               | `<serial-port>`: serial device path. Stops accel/gyro sampling, stops onboard logging, and prepares the board for sync                                                                                              |
+| `sync`         | `mmsctl sync <serial-port> <output-dir>`                                                                         | `<serial-port>`: serial device path. `<output-dir>`: directory where downloaded CSV files will be saved                                                                                                             |
 
 General command format:
 
@@ -140,20 +139,59 @@ The binary path after building is:
 
 ## Full Recording Workflow
 
-The intended recording workflow is:
+The normal accelerometer + gyroscope recording workflow is:
 
 ```bash
 ./build/linux-native-debug/mmsctl scan
 ./build/linux-native-debug/mmsctl record-reset /dev/ttyACM0
-./build/linux-native-debug/mmsctl battery /dev/ttyACM0
 ./build/linux-native-debug/mmsctl record-start /dev/ttyACM0 --rate 50
 
 # Wear or move the sensor while it records internally.
 
 ./build/linux-native-debug/mmsctl record-stop /dev/ttyACM0
-./build/linux-native-debug/mmsctl battery /dev/ttyACM0
-./build/linux-native-debug/mmsctl sync /dev/ttyACM0 --out data/session_001
+./build/linux-native-debug/mmsctl sync /dev/ttyACM0 data/session_001
 ```
+
+This produces:
+
+```text
+data/session_001/imu.csv
+```
+
+For an accelerometer + gyroscope + battery logging session, enable battery logging with `--battery-interval`:
+
+```bash
+./build/linux-native-debug/mmsctl scan
+./build/linux-native-debug/mmsctl record-reset /dev/ttyACM0
+./build/linux-native-debug/mmsctl record-start /dev/ttyACM0 --rate 25 --battery-interval 60
+
+# Unplug the sensor and run the battery-life / head-motion experiment.
+# Battery state will be sampled once every 60 seconds.
+
+./build/linux-native-debug/mmsctl record-stop /dev/ttyACM0
+./build/linux-native-debug/mmsctl sync /dev/ttyACM0 data/battery_test_001
+```
+
+This produces:
+
+```text
+data/battery_test_001/imu.csv
+data/battery_test_001/battery.csv
+```
+
+`imu.csv` contains accelerometer and gyroscope rows:
+
+```csv
+epoch_ms,sensor,x,y,z
+```
+
+`battery.csv` contains battery voltage and charge rows:
+
+```csv
+epoch_ms,voltage_mv,charge_percent
+```
+
+Battery logging is optional. If `--battery-interval` is not provided to `record-start`, no battery logger or battery timer is created, and `sync` only writes `imu.csv`.
 
 ## Makefile Shortcuts
 
