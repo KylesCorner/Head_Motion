@@ -80,16 +80,169 @@ bool MetaWearSdkBridge::initialize(int timeout_ms) {
     return initialized_ && initialize_status_ == 0;
 }
 
+// void MetaWearSdkBridge::pumpOnce(int timeout_ms) {
+//     const auto frames = usb_.readFrames(std::chrono::milliseconds(timeout_ms));
+
+//     for (const auto& frame : frames) {
+//         if (frame.payload.empty()) {
+//             std::cerr << "SDK bridge RX: empty frame\n";
+//             continue;
+//         }
+
+//         if (frame.payload.size() < 2) {
+//             std::cerr << "SDK bridge RX: short frame ["
+//                       << frame.payload.size()
+//                       << " bytes]: "
+//                       << headmotion::util::hexDump(frame.payload)
+//                       << "\n";
+//             continue;
+//         }
+
+//         // Optional: enable temporarily if needed
+//         // std::cerr << "SDK bridge RX payload ["
+//         //           << frame.payload.size()
+//         //           << " bytes]: "
+//         //           << headmotion::util::hexDump(frame.payload)
+//         //           << "\n";
+
+//         feedNotificationPayload(frame.payload);
+//     }
+// }
+// void MetaWearSdkBridge::pumpOnce(int timeout_ms) {
+//     if (in_pump_) {
+//         return;
+//     }
+
+//     struct PumpGuard {
+//         bool& flag;
+
+//         explicit PumpGuard(bool& value)
+//             : flag(value) {
+//             flag = true;
+//         }
+
+//         ~PumpGuard() {
+//             flag = false;
+//         }
+//     };
+
+//     PumpGuard guard(in_pump_);
+
+//     const auto frames = usb_.readFrames(std::chrono::milliseconds(timeout_ms));
+//     for (const auto& frame : frames) {
+//         if (frame.payload.empty()) {
+//             continue;
+//         }
+
+//         if (frame.payload.size() < 2) {
+//             std::cerr
+//                 << "\n[metawear RX short] "
+//                 << headmotion::util::hexDump(frame.payload)
+//                 << "\n";
+//             continue;
+//         }
+
+//         if (frame.payload[0] == 0x0b) {
+//             std::cerr
+//                 << "\n[metawear RX logging] "
+//                 << headmotion::util::hexDump(frame.payload)
+//                 << "\n";
+//         }
+
+//         feedNotificationPayload(frame.payload);
+//     }
+//     // for (const auto& frame : frames) {
+//     //     if (frame.payload.empty()) {
+//     //         continue;
+//     //     }
+
+//     //     if (frame.payload.size() < 2) {
+//     //         continue;
+//     //     }
+
+//     //     feedNotificationPayload(frame.payload);
+//     // }
+// }
+
 void MetaWearSdkBridge::pumpOnce(int timeout_ms) {
-    const auto frames = usb_.readFrames(std::chrono::milliseconds(timeout_ms));
-
-    for (const auto& frame : frames) {
-        // std::cout << "SDK bridge RX payload: "
-        //           << headmotion::util::hexDump(frame.payload)
-        //           << "\n";
-
-        feedNotificationPayload(frame.payload);
+    if (in_pump_) {
+        pump_requested_ = true;
+        return;
     }
+
+    struct PumpGuard {
+        bool& flag;
+
+        explicit PumpGuard(bool& value)
+            : flag(value) {
+            flag = true;
+        }
+
+        ~PumpGuard() {
+            flag = false;
+        }
+    };
+
+    PumpGuard guard(in_pump_);
+    static std::uint64_t log_data_packets_seen = 0;
+
+    do {
+        pump_requested_ = false;
+
+        const auto frames =
+            usb_.readFrames(std::chrono::milliseconds(timeout_ms));
+
+        for (const auto& frame : frames) {
+            if (frame.payload.empty()) {
+                std::cerr << "\n[metawear RX empty]\n";
+                continue;
+            }
+
+            if (frame.payload.size() < 2) {
+                std::cerr
+                    << "\n[metawear RX short] "
+                    << headmotion::util::hexDump(frame.payload)
+                    << "\n";
+                continue;
+            }
+
+            const bool is_logging_packet =
+                frame.payload[0] == 0x0b;
+
+            const bool is_log_data_packet =
+                is_logging_packet && frame.payload[1] == 0x07;
+
+            if (is_log_data_packet) {
+                ++log_data_packets_seen;
+
+                // if ((log_data_packets_seen % 1000) == 0) {
+                //     std::cerr
+                //         << "\n[metawear RX log data packets] "
+                //         << log_data_packets_seen
+                //         << "\n";
+                // }
+            }
+            /*
+            * 0B 07 is the high-rate log data stream. Do not print every one.
+            * We only care about logging control/status packets now.
+            */
+            // if (is_logging_packet && !is_log_data_packet) {
+            //     std::cerr
+            //         << "\n[metawear RX logging control] "
+            //         << headmotion::util::hexDump(frame.payload)
+            //         << "\n";
+            // }
+
+            feedNotificationPayload(frame.payload);
+        }
+        /*
+         * If the SDK wrote a command while processing a notification, do one
+         * immediate follow-up read pass after unwinding, rather than recursing.
+         */
+        timeout_ms = 10;
+
+    } 
+    while (pump_requested_);
 }
 
 bool MetaWearSdkBridge::initialized() const {
@@ -108,25 +261,85 @@ void MetaWearSdkBridge::handleWriteGattChar(
     std::uint8_t length
 ) {
     (void)caller;
+    (void)write_type;
     (void)characteristic;
 
     const std::vector<std::uint8_t> payload(value, value + length);
+     /*
+     * USB CDC is much faster than the BLE transport the MetaWear SDK was
+     * originally designed around. During large log downloads, the SDK can issue
+     * page/readout commands back-to-back. Pace outbound commands explicitly
+     * instead of relying on terminal/debug logging to slow the loop down.
+     */
+    constexpr auto MIN_WRITE_SPACING =
+        std::chrono::milliseconds(5);
 
-    // std::cout << "SDK write_gatt_char TX payload ["
-    //           << payload.size()
-    //           << " bytes]: "
-    //           << headmotion::util::hexDump(payload)
-    //           << "\n";
+    const auto now = std::chrono::steady_clock::now();
+        if (last_write_time_ != std::chrono::steady_clock::time_point{}) {
+        const auto elapsed = now - last_write_time_;
+
+        if (elapsed < MIN_WRITE_SPACING) {
+            std::this_thread::sleep_for(MIN_WRITE_SPACING - elapsed);
+        }
+    }
+
+    // if (!payload.empty() && payload[0] == 0x0b) {
+    //     std::cerr
+    //         << "\n[metawear TX logging] "
+    //         << headmotion::util::hexDump(payload)
+    //         << "\n";
+    // }
 
     usb_.writePayload(payload);
 
-    /*
-     * Some SDK writes produce an immediate module response.
-     * Pull a short response window here and feed it back as if it were
-     * a BLE notification.
-     */
+    if (in_pump_) {
+        pump_requested_ = true;
+        return;
+    }
+
     pumpOnce(150);
 }
+
+// void MetaWearSdkBridge::handleWriteGattChar(
+//     const void* caller,
+//     MblMwGattCharWriteType write_type,
+//     const MblMwGattChar* characteristic,
+//     const std::uint8_t* value,
+//     std::uint8_t length
+// ) {
+//     (void)caller;
+//     (void)characteristic;
+
+//     const std::vector<std::uint8_t> payload(value, value + length);
+
+//     std::cout << "SDK write_gatt_char TX payload ["
+//               << payload.size()
+//               << " bytes]: "
+//               << headmotion::util::hexDump(payload)
+//               << "\n";
+
+//     if (!payload.empty() && payload[0] == 0x0b) {
+//         std::cerr
+//             << "\n[metawear TX logging] "
+//             << headmotion::util::hexDump(payload)
+//             << "\n";
+//     }
+//     usb_.writePayload(payload);
+
+//     /*
+//      * Some SDK writes produce an immediate module response.
+//      * Pull a short response window here and feed it back as if it were
+//      * a BLE notification.
+//      * 
+//      * However, when this write callback is invoked from inside SDK notification
+//      * handling, calling pumpOnce() recursively causes stack growth during log
+//      * page handshakes. Only do the short response pump when we are not already
+//      * inside pumpOnce().
+//      */
+//     if (!in_pump_) {
+//         pumpOnce(150);
+//     }
+// }
 
 void MetaWearSdkBridge::handleReadGattChar(
     const void* caller,
@@ -200,10 +413,21 @@ void MetaWearSdkBridge::handleDisconnectSubscribe(
 
     std::cout << "SDK on_disconnect registered\n";
 }
-
 void MetaWearSdkBridge::feedNotificationPayload(
     const std::vector<std::uint8_t>& payload
 ) {
+    if (payload.empty()) {
+        std::cerr << "SDK bridge: dropping empty notification payload\n";
+        return;
+    }
+
+    if (payload.size() < 2) {
+    std::cerr << "SDK bridge: dropping short notification payload ["
+              << payload.size()
+              << " bytes]\n";
+    return;
+    }
+
     if (notify_handler_ == nullptr || notify_caller_ == nullptr) {
         std::cout << "SDK bridge has no notification handler yet; dropping payload\n";
         return;
@@ -219,6 +443,25 @@ void MetaWearSdkBridge::feedNotificationPayload(
         static_cast<std::uint8_t>(payload.size())
     );
 }
+
+// void MetaWearSdkBridge::feedNotificationPayload(
+//     const std::vector<std::uint8_t>& payload
+// ) {
+//     if (notify_handler_ == nullptr || notify_caller_ == nullptr) {
+//         std::cout << "SDK bridge has no notification handler yet; dropping payload\n";
+//         return;
+//     }
+
+//     if (payload.size() > 255) {
+//         throw std::runtime_error("Cannot feed SDK notification payload larger than 255 bytes");
+//     }
+
+//     notify_handler_(
+//         notify_caller_,
+//         payload.data(),
+//         static_cast<std::uint8_t>(payload.size())
+//     );
+// }
 std::vector<std::uint8_t> MetaWearSdkBridge::serializeBoard() const {
     if (board_ == nullptr) {
         throw std::runtime_error("Cannot serialize null MetaWear board");

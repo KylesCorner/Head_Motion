@@ -144,12 +144,13 @@ The normal accelerometer + gyroscope recording workflow is:
 ```bash
 ./build/linux-native-debug/mmsctl scan
 ./build/linux-native-debug/mmsctl record-reset /dev/ttyACM0
+sleep 3
 ./build/linux-native-debug/mmsctl record-start /dev/ttyACM0 --rate 50
 
 # Wear or move the sensor while it records internally.
 
 ./build/linux-native-debug/mmsctl record-stop /dev/ttyACM0
-./build/linux-native-debug/mmsctl sync /dev/ttyACM0 data/session_001
+./build/linux-native-debug/mmsctl sync /dev/ttyACM0 --out data/session_001
 ```
 
 This produces:
@@ -163,13 +164,14 @@ For an accelerometer + gyroscope + battery logging session, enable battery loggi
 ```bash
 ./build/linux-native-debug/mmsctl scan
 ./build/linux-native-debug/mmsctl record-reset /dev/ttyACM0
+sleep 3
 ./build/linux-native-debug/mmsctl record-start /dev/ttyACM0 --rate 25 --battery-interval 60
 
 # Unplug the sensor and run the battery-life / head-motion experiment.
 # Battery state will be sampled once every 60 seconds.
 
 ./build/linux-native-debug/mmsctl record-stop /dev/ttyACM0
-./build/linux-native-debug/mmsctl sync /dev/ttyACM0 data/battery_test_001
+./build/linux-native-debug/mmsctl sync /dev/ttyACM0 --out data/battery_test_001
 ```
 
 This produces:

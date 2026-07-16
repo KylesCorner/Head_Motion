@@ -38,6 +38,11 @@ public:
 private:
     headmotion::metawear::MetaWearUsbTransport& usb_;
 
+    bool in_pump_ = false;
+    bool pump_requested_ = false;
+
+    std::chrono::steady_clock::time_point last_write_time_{};
+
     MblMwBtleConnection connection_{};
     MblMwMetaWearBoard* board_ = nullptr;
 

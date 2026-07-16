@@ -23,6 +23,7 @@ extern "C" {
 #include "metawear/core/types.h"
 }
 
+#include <iomanip>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
@@ -45,7 +46,7 @@ namespace {
  *
  * Set this to false if you want sync to be non-destructive.
  */
-constexpr bool CLEAR_AFTER_SUCCESSFUL_SYNC = true;
+constexpr bool CLEAR_AFTER_SUCCESSFUL_SYNC = false;
 
 struct LoggerMetadata {
     int accel_logger_id = -1;
@@ -153,44 +154,181 @@ float readFloatLe(const std::uint8_t* bytes) {
     std::memcpy(&value, bytes, sizeof(float));
     return value;
 }
+const char* dataTypeName(MblMwDataTypeId type_id) {
+    switch (type_id) {
+        case MBL_MW_DT_ID_UINT32:
+            return "UINT32";
+        case MBL_MW_DT_ID_FLOAT:
+            return "FLOAT";
+        case MBL_MW_DT_ID_CARTESIAN_FLOAT:
+            return "CARTESIAN_FLOAT";
+        case MBL_MW_DT_ID_INT32:
+            return "INT32";
+        case MBL_MW_DT_ID_BYTE_ARRAY:
+            return "BYTE_ARRAY";
+        case MBL_MW_DT_ID_BATTERY_STATE:
+            return "BATTERY_STATE";
+        default:
+            return "UNKNOWN";
+    }
+}
 
+void printUnexpectedData(
+    const char* stream_name,
+    const MblMwData* data,
+    const char* reason
+) {
+    if (data == nullptr) {
+        std::cerr << stream_name << ": null MblMwData: " << reason << "\n";
+        return;
+    }
+
+    std::cerr
+        << stream_name
+        << ": skipping unexpected data: "
+        << reason
+        << ", epoch="
+        << data->epoch
+        << ", type="
+        << static_cast<int>(data->type_id)
+        << " ("
+        << dataTypeName(data->type_id)
+        << ")"
+        << ", length="
+        << static_cast<int>(data->length)
+        << ", value="
+        << data->value
+        << "\n";
+}
 void writeImuDataRow(
     SyncState* state,
     const char* sensor,
     const MblMwData* data
 ) {
-    if (state == nullptr || data == nullptr) {
+    if (state == nullptr) {
         return;
     }
 
-    if (data->value == nullptr || data->length != 12) {
+    if (data == nullptr) {
+        printUnexpectedData(sensor, data, "data is null");
         return;
     }
 
-    const auto* bytes = static_cast<const std::uint8_t*>(data->value);
+    if (data->value == nullptr) {
+        printUnexpectedData(sensor, data, "data->value is null");
+        return;
+    }
 
-    const float x = readFloatLe(bytes + 0);
-    const float y = readFloatLe(bytes + 4);
-    const float z = readFloatLe(bytes + 8);
+    if (data->type_id != MBL_MW_DT_ID_CARTESIAN_FLOAT) {
+        printUnexpectedData(sensor, data, "expected CARTESIAN_FLOAT");
+        return;
+    }
+
+    if (data->length < sizeof(MblMwCartesianFloat)) {
+        printUnexpectedData(sensor, data, "value is shorter than MblMwCartesianFloat");
+        return;
+    }
+
+
+    const auto* value =
+        static_cast<const MblMwCartesianFloat*>(data->value);
 
     std::lock_guard<std::mutex> lock(state->csv_mutex);
+
+    if (!state->imu_csv.is_open()) {
+        printUnexpectedData(sensor, data, "imu_csv is not open");
+        return;
+    }
+
 
     state->imu_csv
         << data->epoch << ","
         << sensor << ","
-        << x << ","
-        << y << ","
-        << z
+        << value->x << ","
+        << value->y << ","
+        << value->z
         << "\n";
 
     state->imu_rows_written++;
 }
+// void writeImuDataRow(
+//     SyncState* state,
+//     const char* sensor,
+//     const MblMwData* data
+// ) {
+//     if (state == nullptr || data == nullptr) {
+//         return;
+//     }
 
+//     if (data->value == nullptr || data->length != 12) {
+//         return;
+//     }
+
+//     const auto* bytes = static_cast<const std::uint8_t*>(data->value);
+
+//     const float x = readFloatLe(bytes + 0);
+//     const float y = readFloatLe(bytes + 4);
+//     const float z = readFloatLe(bytes + 8);
+
+//     std::lock_guard<std::mutex> lock(state->csv_mutex);
+
+//     state->imu_csv
+//         << data->epoch << ","
+//         << sensor << ","
+//         << x << ","
+//         << y << ","
+//         << z
+//         << "\n";
+
+//     state->imu_rows_written++;
+// }
+
+// void writeBatteryDataRow(
+//     SyncState* state,
+//     const MblMwData* data
+// ) {
+//     if (state == nullptr || data == nullptr || data->value == nullptr) {
+//         return;
+//     }
+
+//     const auto* battery =
+//         static_cast<const MblMwBatteryState*>(data->value);
+
+//     std::lock_guard<std::mutex> lock(state->csv_mutex);
+
+//     state->battery_csv
+//         << data->epoch << ","
+//         << battery->voltage << ","
+//         << static_cast<int>(battery->charge)
+//         << "\n";
+
+//     state->battery_rows_written++;
+// }
 void writeBatteryDataRow(
     SyncState* state,
     const MblMwData* data
 ) {
-    if (state == nullptr || data == nullptr || data->value == nullptr) {
+    if (state == nullptr) {
+        return;
+    }
+
+    if (data == nullptr) {
+        printUnexpectedData("battery", data, "data is null");
+        return;
+    }
+
+    if (data->value == nullptr) {
+        printUnexpectedData("battery", data, "data->value is null");
+        return;
+    }
+
+    if (data->type_id != MBL_MW_DT_ID_BATTERY_STATE) {
+        printUnexpectedData("battery", data, "expected BATTERY_STATE");
+        return;
+    }
+
+    if (!state->battery_csv.is_open()) {
+        printUnexpectedData("battery", data, "battery_csv is not open");
         return;
     }
 
@@ -208,17 +346,40 @@ void writeBatteryDataRow(
     state->battery_rows_written++;
 }
 
+void markDownloadStarted(SyncState* state) {
+    if (state != nullptr) {
+        state->download_started = true;
+    }
+}
+
 void onAccelLoggerData(void* context, const MblMwData* data) {
-    writeImuDataRow(static_cast<SyncState*>(context), "accel_g", data);
+    auto* state = static_cast<SyncState*>(context);
+    markDownloadStarted(state);
+    writeImuDataRow(state, "accel_g", data);
 }
 
 void onGyroLoggerData(void* context, const MblMwData* data) {
-    writeImuDataRow(static_cast<SyncState*>(context), "gyro_dps", data);
+    auto* state = static_cast<SyncState*>(context);
+    markDownloadStarted(state);
+    writeImuDataRow(state, "gyro_dps", data);
 }
 
 void onBatteryLoggerData(void* context, const MblMwData* data) {
-    writeBatteryDataRow(static_cast<SyncState*>(context), data);
+    auto* state = static_cast<SyncState*>(context);
+    markDownloadStarted(state);
+    writeBatteryDataRow(state, data);
 }
+// void onAccelLoggerData(void* context, const MblMwData* data) {
+//     writeImuDataRow(static_cast<SyncState*>(context), "accel_g", data);
+// }
+
+// void onGyroLoggerData(void* context, const MblMwData* data) {
+//     writeImuDataRow(static_cast<SyncState*>(context), "gyro_dps", data);
+// }
+
+// void onBatteryLoggerData(void* context, const MblMwData* data) {
+//     writeBatteryDataRow(static_cast<SyncState*>(context), data);
+// }
 
 void onProgressUpdate(
     void* context,
@@ -230,6 +391,13 @@ void onProgressUpdate(
     if (state == nullptr) {
         return;
     }
+
+    // std::cerr
+    // << "\n[progress callback] entries_left="
+    // << entries_left
+    // << ", total_entries="
+    // << total_entries
+    // << "\n";
 
     state->download_started = true;
     state->entries_left = entries_left;
@@ -270,6 +438,7 @@ void onUnhandledEntry(void* context, const MblMwData* data) {
 }
 
 void closeCsvs(SyncState& state, bool battery_enabled) {
+    std::lock_guard<std::mutex> lock(state.csv_mutex);
     if (state.imu_csv.is_open()) {
         state.imu_csv.flush();
         state.imu_csv.close();
@@ -290,6 +459,13 @@ std::uint64_t totalRowsWritten(const SyncState& state) {
 
 int runSyncCommand(const std::string& port_name, const std::string& output_path) {
     using namespace std::chrono_literals;
+
+    /*
+     * These must outlive MetaWearSdkBridge/MetaWearUsbTransport because the SDK
+     * can hold callback context pointers into them.
+     */
+    SyncState sync_state;
+    MblMwLogDownloadHandler download_handler = {};
 
     headmotion::transport::SerialConfig config;
     config.port_name = port_name;
@@ -367,8 +543,6 @@ int runSyncCommand(const std::string& port_name, const std::string& output_path)
     const auto imu_path = output_dir / "imu.csv";
     const auto battery_path = output_dir / "battery.csv";
 
-    SyncState sync_state;
-
     sync_state.imu_csv.open(imu_path, std::ios::binary);
 
     if (!sync_state.imu_csv) {
@@ -401,6 +575,10 @@ int runSyncCommand(const std::string& port_name, const std::string& output_path)
     }
 
     auto* board = bridge.board();
+
+    std::cout << "Flushing MMS log page before download\n";
+    mbl_mw_logging_flush_page(board);
+    pumpFor(bridge, 2000);
 
     MblMwDataLogger* accel_logger =
         mbl_mw_logger_lookup_id(
@@ -471,7 +649,6 @@ int runSyncCommand(const std::string& port_name, const std::string& output_path)
         );
     }
 
-    MblMwLogDownloadHandler download_handler = {};
     download_handler.context = &sync_state;
     download_handler.received_progress_update = onProgressUpdate;
     download_handler.received_unknown_entry = onUnknownEntry;
@@ -481,8 +658,12 @@ int runSyncCommand(const std::string& port_name, const std::string& output_path)
     mbl_mw_logging_download(board, 255, &download_handler);
 
     constexpr auto IDLE_TIMEOUT = std::chrono::minutes(2);
+    constexpr auto PROGRESS_PRINT_INTERVAL = std::chrono::milliseconds(1000);
 
     auto last_progress_time = std::chrono::steady_clock::now();
+    auto last_progress_print_time = std::chrono::steady_clock::now();
+
+    bool printed_progress_line = false;
 
     std::uint64_t last_rows_written =
         totalRowsWritten(sync_state);
@@ -492,9 +673,6 @@ int runSyncCommand(const std::string& port_name, const std::string& output_path)
 
     std::uint32_t last_total_entries =
         sync_state.total_entries.load();
-
-    auto last_progress_print_time = std::chrono::steady_clock::now();
-    bool printed_progress_line = false;
 
     while (!sync_state.download_done.load()) {
         bridge.pumpOnce(10);
@@ -517,32 +695,80 @@ int runSyncCommand(const std::string& port_name, const std::string& output_path)
             current_entries_left != last_entries_left ||
             current_total_entries != last_total_entries;
 
+        /*
+         * Only treat entries_left == 0 as "final progress" after the SDK has
+         * reported a real nonzero total. Otherwise the default 0/0 startup state
+         * would cause this loop to print as fast as it can.
+         */
+        const bool sdk_has_progress_total =
+            current_total_entries > 0;
+
+        const bool sdk_reports_done =
+            sdk_has_progress_total &&
+            current_entries_left == 0;
+
         const bool should_print_progress =
             sync_state.download_started.load() &&
             (
-                now - last_progress_print_time >= std::chrono::seconds(1) ||
-                current_entries_left == 0
+                now - last_progress_print_time >= PROGRESS_PRINT_INTERVAL ||
+                sdk_reports_done
             );
 
         if (should_print_progress) {
-            const std::uint32_t entries_downloaded =
-                current_total_entries >= current_entries_left
-                    ? current_total_entries - current_entries_left
-                    : 0;
+            const std::uint64_t imu_rows =
+                sync_state.imu_rows_written.load();
 
-            const std::uint32_t percent =
-                current_total_entries > 0
-                    ? static_cast<std::uint32_t>(
-                        (static_cast<std::uint64_t>(entries_downloaded) * 100) /
-                        current_total_entries
-                    )
-                    : 0;
+            const std::uint64_t battery_rows =
+                sync_state.battery_rows_written.load();
+
+            const std::uint64_t total_rows =
+                imu_rows + battery_rows;
+
+            /*
+             * "\r" returns to the start of the current terminal line.
+             * "\033[K" clears the rest of that line so stale characters from
+             * a longer previous progress message do not remain visible.
+             */
+            std::cout << "\r\033[K";
 
             std::cout
-                << "\rDownload: "
-                << percent
-                << "%"
-                << std::flush;
+                << "Download: "
+                << total_rows
+                << " rows"
+                << " (IMU="
+                << imu_rows
+                << ", battery="
+                << battery_rows
+                << ")";
+
+            if (sdk_has_progress_total &&
+                current_total_entries >= current_entries_left) {
+
+                const std::uint32_t entries_downloaded =
+                    current_total_entries - current_entries_left;
+
+                const double sdk_percent =
+                    (
+                        static_cast<double>(entries_downloaded) * 100.0
+                    ) / static_cast<double>(current_total_entries);
+
+                std::cout
+                    << " | SDK: "
+                    << std::fixed
+                    << std::setprecision(2)
+                    << sdk_percent
+                    << "% "
+                    << "("
+                    << entries_downloaded
+                    << "/"
+                    << current_total_entries
+                    << " entries)";
+            } else {
+                std::cout
+                    << " | SDK: waiting for total entry count";
+            }
+
+            std::cout << std::flush;
 
             printed_progress_line = true;
             last_progress_print_time = now;
@@ -558,7 +784,12 @@ int runSyncCommand(const std::string& port_name, const std::string& output_path)
 
         if (sync_state.download_started.load() &&
             now - last_progress_time > IDLE_TIMEOUT) {
-            std::cerr << "\nSync timed out: no download progress for 2 minutes.\n";
+            if (printed_progress_line) {
+                std::cout << "\n";
+                printed_progress_line = false;
+            }
+
+            std::cerr << "Sync timed out: no download progress for 2 minutes.\n";
             std::cerr << "IMU rows written so far: "
                       << sync_state.imu_rows_written.load()
                       << "\n";
@@ -586,7 +817,12 @@ int runSyncCommand(const std::string& port_name, const std::string& output_path)
 
         if (!sync_state.download_started.load() &&
             now - last_progress_time > IDLE_TIMEOUT) {
-            std::cerr << "\nSync timed out: download did not start within 2 minutes.\n";
+            if (printed_progress_line) {
+                std::cout << "\n";
+                printed_progress_line = false;
+            }
+
+            std::cerr << "Sync timed out: download did not start within 2 minutes.\n";
             std::cerr << "IMU rows written so far: "
                       << sync_state.imu_rows_written.load()
                       << "\n";
