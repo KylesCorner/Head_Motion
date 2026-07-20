@@ -80,90 +80,6 @@ bool MetaWearSdkBridge::initialize(int timeout_ms) {
     return initialized_ && initialize_status_ == 0;
 }
 
-// void MetaWearSdkBridge::pumpOnce(int timeout_ms) {
-//     const auto frames = usb_.readFrames(std::chrono::milliseconds(timeout_ms));
-
-//     for (const auto& frame : frames) {
-//         if (frame.payload.empty()) {
-//             std::cerr << "SDK bridge RX: empty frame\n";
-//             continue;
-//         }
-
-//         if (frame.payload.size() < 2) {
-//             std::cerr << "SDK bridge RX: short frame ["
-//                       << frame.payload.size()
-//                       << " bytes]: "
-//                       << headmotion::util::hexDump(frame.payload)
-//                       << "\n";
-//             continue;
-//         }
-
-//         // Optional: enable temporarily if needed
-//         // std::cerr << "SDK bridge RX payload ["
-//         //           << frame.payload.size()
-//         //           << " bytes]: "
-//         //           << headmotion::util::hexDump(frame.payload)
-//         //           << "\n";
-
-//         feedNotificationPayload(frame.payload);
-//     }
-// }
-// void MetaWearSdkBridge::pumpOnce(int timeout_ms) {
-//     if (in_pump_) {
-//         return;
-//     }
-
-//     struct PumpGuard {
-//         bool& flag;
-
-//         explicit PumpGuard(bool& value)
-//             : flag(value) {
-//             flag = true;
-//         }
-
-//         ~PumpGuard() {
-//             flag = false;
-//         }
-//     };
-
-//     PumpGuard guard(in_pump_);
-
-//     const auto frames = usb_.readFrames(std::chrono::milliseconds(timeout_ms));
-//     for (const auto& frame : frames) {
-//         if (frame.payload.empty()) {
-//             continue;
-//         }
-
-//         if (frame.payload.size() < 2) {
-//             std::cerr
-//                 << "\n[metawear RX short] "
-//                 << headmotion::util::hexDump(frame.payload)
-//                 << "\n";
-//             continue;
-//         }
-
-//         if (frame.payload[0] == 0x0b) {
-//             std::cerr
-//                 << "\n[metawear RX logging] "
-//                 << headmotion::util::hexDump(frame.payload)
-//                 << "\n";
-//         }
-
-//         feedNotificationPayload(frame.payload);
-//     }
-//     // for (const auto& frame : frames) {
-//     //     if (frame.payload.empty()) {
-//     //         continue;
-//     //     }
-
-//     //     if (frame.payload.size() < 2) {
-//     //         continue;
-//     //     }
-
-//     //     feedNotificationPayload(frame.payload);
-//     // }
-// }
-
 void MetaWearSdkBridge::pumpOnce(int timeout_ms) {
     if (in_pump_) {
         pump_requested_ = true;
@@ -194,15 +110,15 @@ void MetaWearSdkBridge::pumpOnce(int timeout_ms) {
 
         for (const auto& frame : frames) {
             if (frame.payload.empty()) {
-                std::cerr << "\n[metawear RX empty]\n";
+                // std::cerr << "\n[metawear RX empty]\n";
                 continue;
             }
 
             if (frame.payload.size() < 2) {
-                std::cerr
-                    << "\n[metawear RX short] "
-                    << headmotion::util::hexDump(frame.payload)
-                    << "\n";
+                // std::cerr
+                //     << "\n[metawear RX short] "
+                //     << headmotion::util::hexDump(frame.payload)
+                //     << "\n";
                 continue;
             }
 
@@ -272,7 +188,7 @@ void MetaWearSdkBridge::handleWriteGattChar(
      * instead of relying on terminal/debug logging to slow the loop down.
      */
     constexpr auto MIN_WRITE_SPACING =
-        std::chrono::milliseconds(5);
+        std::chrono::microseconds(600);
 
     const auto now = std::chrono::steady_clock::now();
         if (last_write_time_ != std::chrono::steady_clock::time_point{}) {
@@ -289,8 +205,9 @@ void MetaWearSdkBridge::handleWriteGattChar(
     //         << headmotion::util::hexDump(payload)
     //         << "\n";
     // }
-
     usb_.writePayload(payload);
+
+    last_write_time_ = std::chrono::steady_clock::now();
 
     if (in_pump_) {
         pump_requested_ = true;
@@ -298,6 +215,15 @@ void MetaWearSdkBridge::handleWriteGattChar(
     }
 
     pumpOnce(150);
+
+    // usb_.writePayload(payload);
+
+    // if (in_pump_) {
+    //     pump_requested_ = true;
+    //     return;
+    // }
+
+    // pumpOnce(150);
 }
 
 // void MetaWearSdkBridge::handleWriteGattChar(
@@ -413,28 +339,99 @@ void MetaWearSdkBridge::handleDisconnectSubscribe(
 
     std::cout << "SDK on_disconnect registered\n";
 }
+
 void MetaWearSdkBridge::feedNotificationPayload(
     const std::vector<std::uint8_t>& payload
 ) {
     if (payload.empty()) {
-        std::cerr << "SDK bridge: dropping empty notification payload\n";
         return;
     }
 
     if (payload.size() < 2) {
-    std::cerr << "SDK bridge: dropping short notification payload ["
-              << payload.size()
-              << " bytes]\n";
-    return;
+        return;
     }
 
     if (notify_handler_ == nullptr || notify_caller_ == nullptr) {
-        std::cout << "SDK bridge has no notification handler yet; dropping payload\n";
+        std::cout
+            << "SDK bridge has no notification handler yet; dropping payload\n";
         return;
     }
 
     if (payload.size() > 255) {
-        throw std::runtime_error("Cannot feed SDK notification payload larger than 255 bytes");
+        std::cerr
+            << "SDK bridge: dropping payload larger than SDK callback can accept, len="
+            << payload.size()
+            << "\n";
+
+        return;
+    }
+
+    const bool is_logging_payload =
+        payload[0] == 0x0b;
+
+    /*
+    * Do NOT drop all macro-module packets.
+    *
+    * The SDK may query module info during initialization, for example:
+    *
+    *   0F 80 ...
+    *
+    * That is legitimate and must reach the SDK.
+    *
+    * The crash case observed during long sync was a suspicious macro command
+    * response:
+    *
+    *   0F 02 ... len=176
+    *
+    * This application does not create macros during sync, and a large 0F 02
+    * payload is likely stale or misframed traffic.
+    */
+    if (payload[0] == 0x0f &&
+        payload[1] == 0x02 &&
+        payload.size() > 8) {
+
+        std::cerr
+            << "SDK bridge: dropping suspicious macro response, len="
+            << payload.size()
+            << " payload="
+            << headmotion::util::hexDump(payload)
+            << "\n";
+
+        return;
+    }
+
+    /*
+     * Battery logging is currently disabled. A large timer-create response
+     * during sync is suspicious and has previously crashed inside timer_created().
+     */
+    if (payload[0] == 0x0c &&
+        payload[1] == 0x02 &&
+        payload.size() > 8) {
+
+        std::cerr
+            << "SDK bridge: dropping suspicious timer-create response, len="
+            << payload.size()
+            << " payload="
+            << headmotion::util::hexDump(payload)
+            << "\n";
+
+        return;
+    }
+
+    /*
+     * During sync, large non-logging payloads are suspicious. The valid high-rate
+     * stream should be logging data/control traffic. This prevents a bad USB
+     * frame boundary from being interpreted as an unrelated SDK module response.
+     */
+    if (!is_logging_payload && payload.size() > 32) {
+        std::cerr
+            << "SDK bridge: dropping oversized non-logging payload, len="
+            << payload.size()
+            << " payload="
+            << headmotion::util::hexDump(payload)
+            << "\n";
+
+        return;
     }
 
     notify_handler_(
@@ -443,6 +440,48 @@ void MetaWearSdkBridge::feedNotificationPayload(
         static_cast<std::uint8_t>(payload.size())
     );
 }
+
+// void MetaWearSdkBridge::feedNotificationPayload(
+//     const std::vector<std::uint8_t>& payload
+// ) {
+//     if (payload.empty()) {
+//         std::cerr << "SDK bridge: dropping empty notification payload\n";
+//         return;
+//     }
+
+//     if (payload.size() < 2) {
+//     std::cerr << "SDK bridge: dropping short notification payload ["
+//               << payload.size()
+//               << " bytes]\n";
+//     return;
+//     }
+
+//     if (notify_handler_ == nullptr || notify_caller_ == nullptr) {
+//         std::cout << "SDK bridge has no notification handler yet; dropping payload\n";
+//         return;
+//     }
+
+//     if (payload.size() > 255) {
+//         throw std::runtime_error("Cannot feed SDK notification payload larger than 255 bytes");
+//     }
+
+//     if (payload[0] == 0x0f) {
+//     std::cerr
+//         << "SDK bridge: dropping unexpected macro-module payload, len="
+//         << payload.size()
+//         << " payload="
+//         << headmotion::util::hexDump(payload)
+//         << "\n";
+
+//     return;
+//     }
+
+//     notify_handler_(
+//         notify_caller_,
+//         payload.data(),
+//         static_cast<std::uint8_t>(payload.size())
+//     );
+// }
 
 // void MetaWearSdkBridge::feedNotificationPayload(
 //     const std::vector<std::uint8_t>& payload

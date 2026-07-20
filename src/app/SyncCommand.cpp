@@ -457,6 +457,11 @@ std::uint64_t totalRowsWritten(const SyncState& state) {
 
 } // namespace
 
+/*
+* Valgrind showed a small exit-time leak of 3,172 bytes associated with MetaWear
+* SDK logger deserialization. This does not scale with CSV rows and is not
+* believed to be the cause of long-download instability.
+*/
 int runSyncCommand(const std::string& port_name, const std::string& output_path) {
     using namespace std::chrono_literals;
 

@@ -18,6 +18,15 @@ public:
     static std::vector<UsbFrame> decodeFrames(
         const std::vector<std::uint8_t>& bytes
     );
+    struct DecodeResult {
+    std::vector<UsbFrame> frames;
+    std::size_t consumed_bytes = 0;
+    std::size_t dropped_bytes = 0;
+    };
+
+    static DecodeResult decodeFramesWithConsumption(
+        const std::vector<std::uint8_t>& bytes
+    );
 };
 
 } // namespace headmotion::protocol

@@ -31,6 +31,7 @@ public:
 
 private:
     headmotion::transport::IByteTransport& byte_transport_;
+    std::vector<std::uint8_t> rx_buffer_;
 
     std::vector<std::uint8_t> readRawUntilQuiet(
         std::chrono::milliseconds total_timeout,

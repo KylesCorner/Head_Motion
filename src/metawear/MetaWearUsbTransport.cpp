@@ -3,6 +3,9 @@
 #include <chrono>
 #include <stdexcept>
 #include <vector>
+#include <algorithm>
+#include <iterator>
+
 
 namespace headmotion::metawear {
 
@@ -46,18 +49,91 @@ std::vector<std::uint8_t> MetaWearUsbTransport::transactPayload(
 std::vector<headmotion::protocol::UsbFrame> MetaWearUsbTransport::readFrames(
     std::chrono::milliseconds timeout
 ) {
-    const auto raw = readRawUntilQuiet(
-        timeout,
-        std::chrono::milliseconds{100},
-        1048576
-    );
+    constexpr std::size_t MAX_RX_BUFFER_BYTES = 1048576;
 
-    if (raw.empty()) {
-        return {};
+    std::vector<headmotion::protocol::UsbFrame> out_frames;
+
+    const auto deadline =
+        std::chrono::steady_clock::now() + timeout;
+
+    while (true) {
+        /*
+         * First try to decode anything already buffered from a previous read.
+         */
+        if (!rx_buffer_.empty()) {
+            auto decoded =
+                headmotion::protocol::UsbFrameCodec::decodeFramesWithConsumption(
+                    rx_buffer_
+                );
+
+            if (decoded.consumed_bytes > 0) {
+                rx_buffer_.erase(
+                    rx_buffer_.begin(),
+                    rx_buffer_.begin() +
+                        static_cast<std::ptrdiff_t>(decoded.consumed_bytes)
+                );
+            }
+
+            if (!decoded.frames.empty()) {
+                out_frames.insert(
+                    out_frames.end(),
+                    std::make_move_iterator(decoded.frames.begin()),
+                    std::make_move_iterator(decoded.frames.end())
+                );
+
+                return out_frames;
+            }
+        }
+
+        const auto now = std::chrono::steady_clock::now();
+
+        if (now >= deadline) {
+            break;
+        }
+
+        const auto remaining =
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                deadline - now
+            );
+
+        auto chunk =
+            byte_transport_.read(512, remaining);
+
+        if (chunk.empty()) {
+            continue;
+        }
+
+        if (rx_buffer_.size() + chunk.size() > MAX_RX_BUFFER_BYTES) {
+            throw std::runtime_error(
+                "MetaWear USB RX buffer exceeded max size"
+            );
+        }
+
+        rx_buffer_.insert(
+            rx_buffer_.end(),
+            chunk.begin(),
+            chunk.end()
+        );
     }
 
-    return headmotion::protocol::UsbFrameCodec::decodeFrames(raw);
+    return out_frames;
 }
+
+// std::vector<headmotion::protocol::UsbFrame> MetaWearUsbTransport::readFrames(
+//     std::chrono::milliseconds timeout
+// ) {
+//     const auto raw = readRawUntilQuiet(
+//         timeout,
+//         std::chrono::milliseconds{100},
+//         1048576
+//     );
+
+//     if (raw.empty()) {
+//         return {};
+//     }
+
+//     return headmotion::protocol::UsbFrameCodec::decodeFrames(raw);
+// }
 
 std::vector<std::uint8_t> MetaWearUsbTransport::readRawUntilQuiet(
     std::chrono::milliseconds total_timeout,
