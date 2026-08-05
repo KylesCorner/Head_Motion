@@ -1,99 +1,95 @@
 # Head Motion USB Client
 
-## Project Summary
+A C++ command-line application for recording and downloading data from an MbientLab MetaMotionS / MMS+ sensor over USB serial.
 
-Head Motion USB Client is a C++ command line application for communicating with an MbientLab MetaMotionS / MMS+ sensor over USB serial.
+The application supports the complete internal logging workflow:
 
-This project replaces the older BLE-based client with a USB-first implementation. The purpose of the project is to support the full sensor recording workflow over USB:
-1. Clear any old recording loggers on MetaMotionS.
-2. Start internal recording.
-3. Stop internal recording cleanly.
-4. Sync/download the recorded accelerometer and gyroscope data.
-5. Save the downloaded data to files for analysis.
+1. Discover and save the connected MMS+ serial port.
+2. Clear old logger configuration.
+3. Start accelerometer, gyroscope, and optional battery logging.
+4. Stop recording.
+5. Download recorded data into CSV files.
 
-The current implementation can already communicate with the device over USB, initialize the MetaWear SDK through the USB bridge, and start internal accelerometer and gyroscope logging.
+## Platform Support
 
-Current supported platform:
+Currently supported:
 
-- Linux
+* Linux
 
-Current working features:
+Planned:
 
-- Scan for connected serial devices
-- Identify the MetaMotionS over USB
-- Send raw USB frames
-- Send framed MetaWear command payloads
-- Read MetaWear module info
-- Initialize the MetaWear SDK through the USB bridge
-- Start internal accelerometer and gyroscope logging
-- Record start and stop commands over a wire
-- Sync data into a csv fromat over a wire
+* Windows 11
 
-Required next features:
+## Features
 
-- Compatability with Windows terminal environment
-
+* MMS+ USB serial discovery and verification
+* Saved default serial-port selection
+* Stable device matching using USB metadata
+* Manual `--port` override
+* MetaWear SDK initialization over USB
+* Internal accelerometer and gyroscope logging
+* Optional battery-state logging
+* Recording start, stop, reset, and sync commands
+* Append-only CSV writing
+* Automatic collision-free CSV filenames
 
 ## Installation
 
-### 1. Install system dependencies
+### Install dependencies
 
-On Arch Linux:
+Arch Linux:
 
 ```bash
 sudo pacman -S base-devel cmake ninja git
 ```
 
-On Debian or Ubuntu:
+Debian or Ubuntu:
 
 ```bash
 sudo apt install build-essential cmake ninja-build git
 ```
 
-### 2. Clone this repository
+### Clone the repository
 
 ```bash
 git clone https://github.com/KylesCorner/Head_Motion.git
 cd Head_Motion
 ```
 
-### 3. MetaWear SDK installation
+### Install the MetaWear SDK
 
-From inside the project repo root
+From the repository root:
+
 ```bash
-mkdir -p external && \
-cd external && \
-rm -rf MetaWear-SDK-Cpp && \
-git clone https://github.com/mbientlab/MetaWear-SDK-Cpp.git && \
-cd MetaWear-SDK-Cpp && \
-git submodule update --init --recursive && \
-cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release && \
-cmake --build build
+mkdir -p external
+git clone https://github.com/mbientlab/MetaWear-SDK-Cpp.git \
+    external/MetaWear-SDK-Cpp
 
+cd external/MetaWear-SDK-Cpp
+git submodule update --init --recursive
+cd ../..
+```
+
+### Configure and build
+
+```bash
 cmake -S . -B build/linux-native-debug -G Ninja \
-  -DCMAKE_BUILD_TYPE=Debug \
-  -DHEADMOTION_SERIAL_BACKEND=native \
-  -DMETAWEAR_SDK_DIR="$PWD/external/MetaWear-SDK-Cpp" && \
+    -DCMAKE_BUILD_TYPE=Debug \
+    -DHEADMOTION_SERIAL_BACKEND=native \
+    -DMETAWEAR_SDK_DIR="$PWD/external/MetaWear-SDK-Cpp"
+
 cmake --build build/linux-native-debug
 ```
 
-### 4. Build
-
-Using the included Makefile:
-
-```bash
-make build
-```
-
-The compiled binary will be located at:
+The executable will be located at:
 
 ```text
 build/linux-native-debug/mmsctl
 ```
 
-### 5. Serial permissions
+## Serial Permissions
 
-If the sensor appears as `/dev/ttyACM0` but cannot be opened, add your user to the serial device group.
+The MMS+ normally appears as `/dev/ttyACM*`.
 
 On Arch Linux:
 
@@ -108,70 +104,131 @@ sudo usermod -aG dialout "$USER"
 ```
 
 Log out and log back in after changing group membership.
-## Usage
 
-Command Table:
+## Device Discovery
 
-| Command        | Usage                                                                                                            | Arguments                                                                                                                                                                                                           |
-| -------------- | ---------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `scan`         | `mmsctl scan`                                                                                                    | None                                                                                                                                                                                                                |
-| `identify`     | `mmsctl identify <serial-port>`                                                                                  | `<serial-port>`: serial device path, for example `/dev/ttyACM0`                                                                                                                                                     |
-| `tx-raw`       | `mmsctl tx-raw <serial-port> <hex-bytes>`                                                                        | `<serial-port>`: serial device path. `<hex-bytes>`: full raw USB frame bytes, for example `"1F 02 01 80 0A"`                                                                                                        |
-| `cmd`          | `mmsctl cmd <serial-port> <payload-hex>`                                                                         | `<serial-port>`: serial device path. `<payload-hex>`: MetaWear command payload only; the app wraps it in the USB frame format, for example `"01 80"`                                                                |
-| `module-info`  | `mmsctl module-info <serial-port>`                                                                               | `<serial-port>`: serial device path                                                                                                                                                                                 |
-| `sdk-probe`    | `mmsctl sdk-probe <serial-port>`                                                                                 | `<serial-port>`: serial device path                                                                                                                                                                                 |
-| `record-reset` | `mmsctl record-reset <serial-port>`                                                                              | `<serial-port>`: serial device path. Clears existing onboard logging/routes so a fresh recording session can be configured                                                                                          |
-| `record-start` | `mmsctl record-start <serial-port> [--rate 25\|50\|100\|200\|400\|800\|1600\|3200] [--battery-interval seconds]` | `<serial-port>`: serial device path. `--rate`: optional accel/gyro sample rate in Hz; defaults to `50`. `--battery-interval`: optional battery logging interval in seconds. If omitted, battery logging is disabled |
-| `record-stop`  | `mmsctl record-stop <serial-port>`                                                                               | `<serial-port>`: serial device path. Stops accel/gyro sampling, stops onboard logging, and prepares the board for sync                                                                                              |
-| `sync`         | `mmsctl sync <serial-port> <output-dir>`                                                                         | `<serial-port>`: serial device path. `<output-dir>`: directory where downloaded CSV files will be saved                                                                                                             |
-
-General command format:
-
-```text
-mmsctl <command> [arguments]
-```
-
-The binary path after building is:
-
-```text
-./build/linux-native-debug/mmsctl
-```
-
-## Full Recording Workflow
-
-The normal accelerometer + gyroscope recording workflow is:
+Connect the MMS+ and run:
 
 ```bash
 ./build/linux-native-debug/mmsctl scan
-./build/linux-native-debug/mmsctl record-reset /dev/ttyACM0
-sleep 3
-./build/linux-native-debug/mmsctl record-start /dev/ttyACM0 --rate 50
-
-# Wear or move the sensor while it records internally.
-
-./build/linux-native-debug/mmsctl record-stop /dev/ttyACM0
-./build/linux-native-debug/mmsctl sync /dev/ttyACM0 --out data/session_001
 ```
 
-This produces:
+The scan command identifies the MMS+, verifies it over USB, and saves it as the default device.
+
+The saved device record is stored at:
+
+```text
+data/latest_device_port.bin
+```
+
+After scanning, commands can use the saved device without specifying a serial port.
+
+An explicit port can still be supplied when needed:
+
+```bash
+./build/linux-native-debug/mmsctl identify \
+    --port /dev/ttyACM0
+```
+
+## Usage
+
+General format:
+
+```text
+mmsctl <command> [options]
+```
+
+| Command        | Usage                                                                        | Description                                        |
+| -------------- | ---------------------------------------------------------------------------- | -------------------------------------------------- |
+| `scan`         | `mmsctl scan`                                                                | Discover, verify, and save the default MMS+ device |
+| `identify`     | `mmsctl identify [--port PORT]`                                              | Read device identity information                   |
+| `module-info`  | `mmsctl module-info [--port PORT]`                                           | Read MetaWear module information                   |
+| `sdk-probe`    | `mmsctl sdk-probe [--port PORT]`                                             | Test MetaWear SDK initialization                   |
+| `tx-raw`       | `mmsctl tx-raw [--port PORT] HEX`                                            | Send a complete raw USB frame                      |
+| `cmd`          | `mmsctl cmd [--port PORT] PAYLOAD`                                           | Send a MetaWear payload using USB framing          |
+| `record-reset` | `mmsctl record-reset [--port PORT]`                                          | Clear existing logger configuration                |
+| `record-start` | `mmsctl record-start [--port PORT] [--rate HZ] [--battery-interval SECONDS]` | Start internal recording                           |
+| `record-stop`  | `mmsctl record-stop [--port PORT]`                                           | Stop sampling and internal logging                 |
+| `sync`         | `mmsctl sync [--port PORT] [--out DIRECTORY]`                                | Download logged data into CSV files                |
+
+Supported sample rates:
+
+```text
+25, 50, 100, 200, 400, 800, 1600, 3200 Hz
+```
+
+The default sample rate is `50 Hz`.
+
+Battery logging is disabled unless `--battery-interval` is provided.
+
+## Full Recording Workflow
+
+First discover and save the MMS+ port:
+
+```bash
+./build/linux-native-debug/mmsctl scan
+```
+
+Reset any previous logger configuration:
+
+```bash
+./build/linux-native-debug/mmsctl record-reset
+sleep 3
+```
+
+Start recording:
+
+```bash
+./build/linux-native-debug/mmsctl record-start --rate 50
+```
+
+Wear or move the sensor while it records internally.
+
+Stop recording:
+
+```bash
+./build/linux-native-debug/mmsctl record-stop
+```
+
+Download the recorded data:
+
+```bash
+./build/linux-native-debug/mmsctl sync \
+    --out data/session_001
+```
+
+The downloaded IMU data is written to:
 
 ```text
 data/session_001/imu.csv
 ```
 
-For an accelerometer + gyroscope + battery logging session, enable battery logging with `--battery-interval`:
+The IMU CSV format is:
+
+```csv
+epoch_ms,sensor,x,y,z
+```
+
+## Battery Logging
+
+Start a recording with battery state sampled every 60 seconds:
 
 ```bash
-./build/linux-native-debug/mmsctl scan
-./build/linux-native-debug/mmsctl record-reset /dev/ttyACM0
+./build/linux-native-debug/mmsctl record-reset
 sleep 3
-./build/linux-native-debug/mmsctl record-start /dev/ttyACM0 --rate 25 --battery-interval 60
 
-# Unplug the sensor and run the battery-life / head-motion experiment.
-# Battery state will be sampled once every 60 seconds.
+./build/linux-native-debug/mmsctl record-start \
+    --rate 25 \
+    --battery-interval 60
+```
 
-./build/linux-native-debug/mmsctl record-stop /dev/ttyACM0
-./build/linux-native-debug/mmsctl sync /dev/ttyACM0 --out data/battery_test_001
+Stop and download the recording:
+
+```bash
+./build/linux-native-debug/mmsctl record-stop
+
+./build/linux-native-debug/mmsctl sync \
+    --out data/battery_test_001
 ```
 
 This produces:
@@ -181,81 +238,34 @@ data/battery_test_001/imu.csv
 data/battery_test_001/battery.csv
 ```
 
-`imu.csv` contains accelerometer and gyroscope rows:
-
-```csv
-epoch_ms,sensor,x,y,z
-```
-
-`battery.csv` contains battery voltage and charge rows:
+The battery CSV format is:
 
 ```csv
 epoch_ms,voltage_mv,charge_percent
 ```
 
-Battery logging is optional. If `--battery-interval` is not provided to `record-start`, no battery logger or battery timer is created, and `sync` only writes `imu.csv`.
+## Data Integrity
 
-## Makefile Shortcuts
+The sync command does not overwrite existing CSV files.
 
-Build:
+When the output directory already contains data, the next unused filename is selected:
 
-```bash
-make build
+```text
+imu.csv
+imu_1.csv
+imu_2.csv
 ```
 
-Scan:
+Battery files use the matching number:
 
-```bash
-make run-scan
+```text
+battery.csv
+battery_1.csv
+battery_2.csv
 ```
 
-Identify:
-
-```bash
-make run-identify PORT=/dev/ttyACM0
-```
-
-Send a raw frame:
-
-```bash
-make run-tx-raw PORT=/dev/ttyACM0 HEX="1F 02 01 80 0A"
-```
-
-Read module info:
-
-```bash
-make run-module-info PORT=/dev/ttyACM0
-```
-
-Start recording:
-
-```bash
-make run-record-start PORT=/dev/ttyACM0 RATE=50
-```
-
-Planned stop recording shortcut:
-
-```bash
-make run-record-stop PORT=/dev/ttyACM0
-```
-
-Planned sync shortcut:
-
-```bash
-make run-sync PORT=/dev/ttyACM0 OUT=data/session_001
-```
-
-Clean build artifacts:
-
-```bash
-make clean
-```
-
-Remove the build directory:
-
-```bash
-make distclean
-```
+CSV streams are opened in append mode as an additional safeguard against accidental truncation.
 
 ## License
-To be added
+
+To be added.

@@ -75,6 +75,7 @@ message(STATUS "Using MetaWear SDK target: ${HEADMOTION_METAWEAR_SDK_TARGET}")
 
 add_library(headmotion_session
     src/session/BoardStateStore.cpp
+    src/session/DevicePortStore.cpp
 )
 
 target_include_directories(headmotion_session PUBLIC
@@ -325,6 +326,8 @@ add_library(headmotion_app
     src/app/RecordStopCommand.cpp
     src/app/RecordResetCommand.cpp
     src/app/SyncCommand.cpp
+    src/app/MmsDeviceProbe.cpp
+    src/app/DevicePortResolver.cpp
 )
 
 target_include_directories(headmotion_app PUBLIC

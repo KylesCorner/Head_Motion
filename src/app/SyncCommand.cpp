@@ -75,6 +75,93 @@ struct SyncState {
     std::atomic<std::uint64_t> unhandled_entries{0};
 };
 
+struct CsvOutputPaths {
+    std::filesystem::path imu;
+    std::filesystem::path battery;
+};
+
+CsvOutputPaths chooseUnusedCsvOutputPaths(
+    const std::filesystem::path& output_dir
+) {
+    for (std::uint64_t index = 0; ; ++index) {
+        const std::string suffix =
+            index == 0
+                ? std::string{}
+                : "_" + std::to_string(index);
+
+        CsvOutputPaths candidate{
+            output_dir / ("imu" + suffix + ".csv"),
+            output_dir / ("battery" + suffix + ".csv")
+        };
+
+        /*
+         * Treat either file as a collision so IMU and battery files always
+         * retain the same session number.
+         */
+        if (!std::filesystem::exists(candidate.imu) &&
+            !std::filesystem::exists(candidate.battery)) {
+            return candidate;
+        }
+    }
+}
+bool openCsvForAppend(
+    std::ofstream& stream,
+    const std::filesystem::path& path,
+    const char* header
+) {
+    stream.open(
+        path,
+        std::ios::out |
+        std::ios::binary |
+        std::ios::app
+    );
+
+    if (!stream.is_open()) {
+        std::cerr << "Failed to open CSV: " << path << "\n";
+        return false;
+    }
+
+    /*
+     * std::ios::app guarantees that writes go to the end of the file.
+     * Only write a header when the file is empty.
+     *
+     * Normally chooseUnusedCsvOutputPaths() gives us a new file, but this
+     * check provides an independent second safeguard.
+     */
+    std::error_code size_error;
+    const std::uintmax_t size =
+        std::filesystem::file_size(path, size_error);
+
+    if (size_error) {
+        std::cerr
+            << "Failed to inspect CSV size: "
+            << path
+            << ": "
+            << size_error.message()
+            << "\n";
+
+        stream.close();
+        return false;
+    }
+
+    if (size == 0) {
+        stream << header;
+        stream.flush();
+
+        if (!stream) {
+            std::cerr
+                << "Failed to write CSV header: "
+                << path
+                << "\n";
+
+            stream.close();
+            return false;
+        }
+    }
+
+    return true;
+}
+
 std::filesystem::path loggerMetadataPath() {
     return std::filesystem::path(
         headmotion::session::BoardStateStore::defaultPath() + ".loggers"
@@ -542,43 +629,73 @@ int runSyncCommand(const std::string& port_name, const std::string& output_path)
         std::cout << "Battery logging was disabled for this session\n";
     }
 
+    // const std::filesystem::path output_dir{output_path};
+    // std::filesystem::create_directories(output_dir);
+
+    // const auto imu_path = output_dir / "imu.csv";
+    // const auto battery_path = output_dir / "battery.csv";
+
+    // sync_state.imu_csv.open(imu_path, std::ios::binary);
+
+    // if (!sync_state.imu_csv) {
+    //     std::cerr << "Failed to open IMU CSV: " << imu_path << "\n";
+    //     return 3;
+    // }
+
+    // sync_state.imu_csv
+    //     << "epoch_ms,"
+    //     << "sensor,"
+    //     << "x,"
+    //     << "y,"
+    //     << "z"
+    //     << "\n";
+
+    // if (metadata.battery_enabled) {
+    //     sync_state.battery_csv.open(battery_path, std::ios::binary);
+
+    //     if (!sync_state.battery_csv) {
+    //         std::cerr << "Failed to open battery CSV: " << battery_path << "\n";
+    //         sync_state.imu_csv.close();
+    //         return 3;
+    //     }
+
+    //     sync_state.battery_csv
+    //         << "epoch_ms,"
+    //         << "voltage_mv,"
+    //         << "charge_percent"
+    //         << "\n";
+    // }
     const std::filesystem::path output_dir{output_path};
     std::filesystem::create_directories(output_dir);
 
-    const auto imu_path = output_dir / "imu.csv";
-    const auto battery_path = output_dir / "battery.csv";
+    const CsvOutputPaths csv_paths =
+        chooseUnusedCsvOutputPaths(output_dir);
 
-    sync_state.imu_csv.open(imu_path, std::ios::binary);
+    const auto& imu_path = csv_paths.imu;
+    const auto& battery_path = csv_paths.battery;
 
-    if (!sync_state.imu_csv) {
-        std::cerr << "Failed to open IMU CSV: " << imu_path << "\n";
+    std::cout << "IMU output: " << imu_path << "\n";
+
+    if (!openCsvForAppend(
+            sync_state.imu_csv,
+            imu_path,
+            "epoch_ms,sensor,x,y,z\n"
+        )) {
         return 3;
     }
 
-    sync_state.imu_csv
-        << "epoch_ms,"
-        << "sensor,"
-        << "x,"
-        << "y,"
-        << "z"
-        << "\n";
-
     if (metadata.battery_enabled) {
-        sync_state.battery_csv.open(battery_path, std::ios::binary);
+        std::cout << "Battery output: " << battery_path << "\n";
 
-        if (!sync_state.battery_csv) {
-            std::cerr << "Failed to open battery CSV: " << battery_path << "\n";
+        if (!openCsvForAppend(
+                sync_state.battery_csv,
+                battery_path,
+                "epoch_ms,voltage_mv,charge_percent\n"
+            )) {
             sync_state.imu_csv.close();
             return 3;
         }
-
-        sync_state.battery_csv
-            << "epoch_ms,"
-            << "voltage_mv,"
-            << "charge_percent"
-            << "\n";
     }
-
     auto* board = bridge.board();
 
     std::cout << "Flushing MMS log page before download\n";

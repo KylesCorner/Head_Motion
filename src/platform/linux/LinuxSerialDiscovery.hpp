@@ -9,12 +9,12 @@ namespace headmotion::platform::linux_platform {
 class LinuxSerialDiscovery {
 public:
     std::vector<headmotion::transport::SerialPortInfo> listPorts() const;
+    static bool looksLikeMmsName(const std::string& value);
 
 private:
     static std::vector<headmotion::transport::SerialPortInfo> listGlobbedDevices();
     static std::vector<headmotion::transport::SerialPortInfo> listByIdDevices();
 
-    static bool looksLikeMmsName(const std::string& value);
     static std::string canonicalPath(const std::string& path);
 };
 

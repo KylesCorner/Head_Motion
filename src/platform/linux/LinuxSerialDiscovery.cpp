@@ -6,6 +6,10 @@
 #include <set>
 #include <string>
 #include <vector>
+#include <charconv>
+#include <fstream>
+#include <optional>
+#include <system_error>
 
 namespace fs = std::filesystem;
 
@@ -150,14 +154,14 @@ std::vector<headmotion::transport::SerialPortInfo> LinuxSerialDiscovery::listByI
     return out;
 }
 
-bool LinuxSerialDiscovery::looksLikeMmsName(const std::string& value) {
+bool LinuxSerialDiscovery::looksLikeMmsName(
+    const std::string& value
+) {
     const auto lower = lowerCopy(value);
 
-    return lower.find("mbient") != std::string::npos ||
-           lower.find("metamotion") != std::string::npos ||
-           lower.find("metawear") != std::string::npos ||
-           lower.find("mms") != std::string::npos ||
-           lower.find("f9cb9404c345") != std::string::npos;
+    return lower.find("mbientlab") != std::string::npos ||
+           lower.find("metamotions") != std::string::npos ||
+           lower.find("metawear") != std::string::npos;
 }
 
 std::string LinuxSerialDiscovery::canonicalPath(const std::string& path) {
@@ -169,6 +173,106 @@ std::string LinuxSerialDiscovery::canonicalPath(const std::string& path) {
     }
 
     return canonical.string();
+}
+std::optional<std::string> readTextFile(const fs::path& path) {
+    std::ifstream in(path);
+
+    if (!in) {
+        return std::nullopt;
+    }
+
+    std::string value;
+    std::getline(in, value);
+
+    if (value.empty()) {
+        return std::nullopt;
+    }
+
+    return value;
+}
+
+std::optional<std::string> findUsbAttribute(
+    fs::path current,
+    const char* attribute
+) {
+    std::error_code ec;
+    current = fs::canonical(current, ec);
+
+    if (ec) {
+        return std::nullopt;
+    }
+
+    while (!current.empty() && current != current.root_path()) {
+        if (const auto value = readTextFile(current / attribute)) {
+            return value;
+        }
+
+        current = current.parent_path();
+    }
+
+    return std::nullopt;
+}
+
+std::uint16_t parseHex16(const std::optional<std::string>& text) {
+    if (!text || text->empty()) {
+        return 0;
+    }
+
+    std::uint16_t value = 0;
+
+    const char* begin = text->data();
+    const char* end = begin + text->size();
+
+    const auto [ptr, ec] =
+        std::from_chars(begin, end, value, 16);
+
+    if (ec != std::errc{} || ptr != end) {
+        return 0;
+    }
+
+    return value;
+}
+
+void populateUsbMetadata(
+    headmotion::transport::SerialPortInfo& info
+) {
+    const fs::path tty_name =
+        fs::path(info.path).filename();
+
+    const fs::path sysfs_device =
+        fs::path("/sys/class/tty") / tty_name / "device";
+
+    info.vendor_id =
+        parseHex16(findUsbAttribute(sysfs_device, "idVendor"));
+
+    info.product_id =
+        parseHex16(findUsbAttribute(sysfs_device, "idProduct"));
+
+    info.serial_number =
+        findUsbAttribute(sysfs_device, "serial").value_or("");
+
+    info.manufacturer =
+        findUsbAttribute(sysfs_device, "manufacturer").value_or("");
+
+    info.product_name =
+        findUsbAttribute(sysfs_device, "product").value_or("");
+
+    constexpr std::uint16_t mms_vendor_id = 0x1915;
+    constexpr std::uint16_t mms_product_id = 0xd978;
+
+    const bool exact_usb_match =
+        info.vendor_id == mms_vendor_id &&
+        info.product_id == mms_product_id;
+
+    const std::string combined =
+        info.display_name + " " +
+        info.symlink_path + " " +
+        info.manufacturer + " " +
+        info.product_name;
+
+    info.likely_mms =
+        exact_usb_match ||
+        LinuxSerialDiscovery::looksLikeMmsName(combined);
 }
 
 } // namespace headmotion::platform::linux_platform
