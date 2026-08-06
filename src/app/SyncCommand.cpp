@@ -35,6 +35,7 @@ extern "C" {
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <optional>
 
 namespace headmotion::app {
 
@@ -48,7 +49,22 @@ namespace {
  */
 constexpr bool CLEAR_AFTER_SUCCESSFUL_SYNC = false;
 
+// struct LoggerMetadata {
+//     int accel_logger_id = -1;
+//     int gyro_logger_id = -1;
+
+//     bool battery_enabled = false;
+//     int battery_logger_id = -1;
+//     int battery_timer_id = -1;
+//     std::uint32_t battery_interval_seconds = 0;
+// };
+
 struct LoggerMetadata {
+    int metadata_version = 1;
+
+    std::int64_t recording_start_epoch_ms = -1;
+    std::uint32_t sample_rate_hz = 0;
+
     int accel_logger_id = -1;
     int gyro_logger_id = -1;
 
@@ -58,10 +74,37 @@ struct LoggerMetadata {
     std::uint32_t battery_interval_seconds = 0;
 };
 
+// struct SyncState {
+//     std::ofstream imu_csv;
+//     std::ofstream battery_csv;
+//     std::mutex csv_mutex;
+
+//     std::atomic<bool> download_started{false};
+//     std::atomic<bool> download_done{false};
+
+//     std::atomic<std::uint32_t> entries_left{0};
+//     std::atomic<std::uint32_t> total_entries{0};
+
+//     std::atomic<std::uint64_t> imu_rows_written{0};
+//     std::atomic<std::uint64_t> battery_rows_written{0};
+//     std::atomic<std::uint64_t> unknown_entries{0};
+//     std::atomic<std::uint64_t> unhandled_entries{0};
+// };
+
 struct SyncState {
     std::ofstream imu_csv;
     std::ofstream battery_csv;
     std::mutex csv_mutex;
+
+    /*
+     * New recordings contain recording_start_epoch_ms.
+     *
+     * first_sdk_epoch_ms is only used as a compatibility fallback when
+     * downloading a recording created by an older program version.
+     */
+    std::int64_t recording_start_epoch_ms = -1;
+    std::optional<std::int64_t> first_sdk_epoch_ms;
+    bool timestamp_warning_printed = false;
 
     std::atomic<bool> download_started{false};
     std::atomic<bool> download_done{false};
@@ -193,7 +236,17 @@ LoggerMetadata loadLoggerMetadata() {
         const std::string key = line.substr(0, pos);
         const std::string value = line.substr(pos + 1);
 
-        if (key == "accel_logger_id") {
+        if (key == "metadata_version") {
+            metadata.metadata_version = std::stoi(value);
+        } else if (key == "recording_start_epoch_ms") {
+            metadata.recording_start_epoch_ms =
+                std::stoll(value);
+        } else if (key == "sample_rate_hz") {
+            metadata.sample_rate_hz =
+                static_cast<std::uint32_t>(
+                    std::stoul(value)
+                );
+        } else if (key == "accel_logger_id") {
             metadata.accel_logger_id = std::stoi(value);
         } else if (key == "gyro_logger_id") {
             metadata.gyro_logger_id = std::stoi(value);
@@ -287,6 +340,52 @@ void printUnexpectedData(
         << data->value
         << "\n";
 }
+struct RowTimestamp {
+    std::int64_t epoch_ms = 0;
+    std::int64_t elapsed_ms = 0;
+};
+
+RowTimestamp resolveRowTimestampLocked(
+    SyncState& state,
+    std::int64_t sdk_epoch_ms
+) {
+    RowTimestamp timestamp;
+    timestamp.epoch_ms = sdk_epoch_ms;
+
+    if (state.recording_start_epoch_ms > 0) {
+        timestamp.elapsed_ms =
+            sdk_epoch_ms -
+            state.recording_start_epoch_ms;
+    } else {
+        /*
+         * Compatibility path for recordings created before the start
+         * timestamp was added to logger metadata.
+         */
+        if (!state.first_sdk_epoch_ms.has_value()) {
+            state.first_sdk_epoch_ms = sdk_epoch_ms;
+        }
+
+        timestamp.elapsed_ms =
+            sdk_epoch_ms -
+            *state.first_sdk_epoch_ms;
+    }
+
+    if (timestamp.elapsed_ms < 0 &&
+        !state.timestamp_warning_printed) {
+        std::cerr
+            << "WARNING: received a timestamp before the saved "
+            << "recording start time. "
+            << "recording_start_epoch_ms="
+            << state.recording_start_epoch_ms
+            << ", sdk_epoch_ms="
+            << sdk_epoch_ms
+            << "\n";
+
+        state.timestamp_warning_printed = true;
+    }
+
+    return timestamp;
+}
 void writeImuDataRow(
     SyncState* state,
     const char* sensor,
@@ -297,84 +396,205 @@ void writeImuDataRow(
     }
 
     if (data == nullptr) {
-        printUnexpectedData(sensor, data, "data is null");
+        printUnexpectedData(
+            sensor,
+            data,
+            "data is null"
+        );
+
         return;
     }
 
     if (data->value == nullptr) {
-        printUnexpectedData(sensor, data, "data->value is null");
+        printUnexpectedData(
+            sensor,
+            data,
+            "data->value is null"
+        );
+
         return;
     }
 
-    if (data->type_id != MBL_MW_DT_ID_CARTESIAN_FLOAT) {
-        printUnexpectedData(sensor, data, "expected CARTESIAN_FLOAT");
+    if (data->type_id !=
+        MBL_MW_DT_ID_CARTESIAN_FLOAT) {
+        printUnexpectedData(
+            sensor,
+            data,
+            "expected CARTESIAN_FLOAT"
+        );
+
         return;
     }
 
-    if (data->length < sizeof(MblMwCartesianFloat)) {
-        printUnexpectedData(sensor, data, "value is shorter than MblMwCartesianFloat");
+    if (data->length <
+        sizeof(MblMwCartesianFloat)) {
+        printUnexpectedData(
+            sensor,
+            data,
+            "value is shorter than MblMwCartesianFloat"
+        );
+
         return;
     }
-
 
     const auto* value =
-        static_cast<const MblMwCartesianFloat*>(data->value);
+        static_cast<const MblMwCartesianFloat*>(
+            data->value
+        );
 
-    std::lock_guard<std::mutex> lock(state->csv_mutex);
+    std::lock_guard<std::mutex> lock(
+        state->csv_mutex
+    );
 
     if (!state->imu_csv.is_open()) {
-        printUnexpectedData(sensor, data, "imu_csv is not open");
+        printUnexpectedData(
+            sensor,
+            data,
+            "imu_csv is not open"
+        );
+
         return;
     }
 
+    const RowTimestamp timestamp =
+        resolveRowTimestampLocked(
+            *state,
+            data->epoch
+        );
 
     state->imu_csv
-        << data->epoch << ","
-        << sensor << ","
-        << value->x << ","
-        << value->y << ","
+        << timestamp.epoch_ms
+        << ","
+        << timestamp.elapsed_ms
+        << ","
+        << sensor
+        << ","
+        << value->x
+        << ","
+        << value->y
+        << ","
         << value->z
         << "\n";
 
+    if (!state->imu_csv) {
+        std::cerr
+            << "Failed to write IMU CSV row\n";
+
+        return;
+    }
+
     state->imu_rows_written++;
 }
-// void writeImuDataRow(
-//     SyncState* state,
-//     const char* sensor,
-//     const MblMwData* data
-// ) {
-//     if (state == nullptr || data == nullptr) {
-//         return;
-//     }
 
-//     if (data->value == nullptr || data->length != 12) {
-//         return;
-//     }
+void writeBatteryDataRow(
+    SyncState* state,
+    const MblMwData* data
+) {
+    if (state == nullptr) {
+        return;
+    }
 
-//     const auto* bytes = static_cast<const std::uint8_t*>(data->value);
+    if (data == nullptr) {
+        printUnexpectedData(
+            "battery",
+            data,
+            "data is null"
+        );
 
-//     const float x = readFloatLe(bytes + 0);
-//     const float y = readFloatLe(bytes + 4);
-//     const float z = readFloatLe(bytes + 8);
+        return;
+    }
 
-//     std::lock_guard<std::mutex> lock(state->csv_mutex);
+    if (data->value == nullptr) {
+        printUnexpectedData(
+            "battery",
+            data,
+            "data->value is null"
+        );
 
-//     state->imu_csv
-//         << data->epoch << ","
-//         << sensor << ","
-//         << x << ","
-//         << y << ","
-//         << z
-//         << "\n";
+        return;
+    }
 
-//     state->imu_rows_written++;
-// }
+    if (data->type_id !=
+        MBL_MW_DT_ID_BATTERY_STATE) {
+        printUnexpectedData(
+            "battery",
+            data,
+            "expected BATTERY_STATE"
+        );
+
+        return;
+    }
+
+    const auto* battery =
+        static_cast<const MblMwBatteryState*>(
+            data->value
+        );
+
+    std::lock_guard<std::mutex> lock(
+        state->csv_mutex
+    );
+
+    if (!state->battery_csv.is_open()) {
+        printUnexpectedData(
+            "battery",
+            data,
+            "battery_csv is not open"
+        );
+
+        return;
+    }
+
+    const RowTimestamp timestamp =
+        resolveRowTimestampLocked(
+            *state,
+            data->epoch
+        );
+
+    state->battery_csv
+        << timestamp.epoch_ms
+        << ","
+        << timestamp.elapsed_ms
+        << ","
+        << battery->voltage
+        << ","
+        << static_cast<int>(battery->charge)
+        << "\n";
+
+    if (!state->battery_csv) {
+        std::cerr
+            << "Failed to write battery CSV row\n";
+
+        return;
+    }
+
+    state->battery_rows_written++;
+}
 
 // void writeBatteryDataRow(
 //     SyncState* state,
 //     const MblMwData* data
 // ) {
-//     if (state == nullptr || data == nullptr || data->value == nullptr) {
+//     if (state == nullptr) {
+//         return;
+//     }
+
+//     if (data == nullptr) {
+//         printUnexpectedData("battery", data, "data is null");
+//         return;
+//     }
+
+//     if (data->value == nullptr) {
+//         printUnexpectedData("battery", data, "data->value is null");
+//         return;
+//     }
+
+//     if (data->type_id != MBL_MW_DT_ID_BATTERY_STATE) {
+//         printUnexpectedData("battery", data, "expected BATTERY_STATE");
+//         return;
+//     }
+
+//     if (!state->battery_csv.is_open()) {
+//         printUnexpectedData("battery", data, "battery_csv is not open");
 //         return;
 //     }
 
@@ -391,47 +611,6 @@ void writeImuDataRow(
 
 //     state->battery_rows_written++;
 // }
-void writeBatteryDataRow(
-    SyncState* state,
-    const MblMwData* data
-) {
-    if (state == nullptr) {
-        return;
-    }
-
-    if (data == nullptr) {
-        printUnexpectedData("battery", data, "data is null");
-        return;
-    }
-
-    if (data->value == nullptr) {
-        printUnexpectedData("battery", data, "data->value is null");
-        return;
-    }
-
-    if (data->type_id != MBL_MW_DT_ID_BATTERY_STATE) {
-        printUnexpectedData("battery", data, "expected BATTERY_STATE");
-        return;
-    }
-
-    if (!state->battery_csv.is_open()) {
-        printUnexpectedData("battery", data, "battery_csv is not open");
-        return;
-    }
-
-    const auto* battery =
-        static_cast<const MblMwBatteryState*>(data->value);
-
-    std::lock_guard<std::mutex> lock(state->csv_mutex);
-
-    state->battery_csv
-        << data->epoch << ","
-        << battery->voltage << ","
-        << static_cast<int>(battery->charge)
-        << "\n";
-
-    state->battery_rows_written++;
-}
 
 void markDownloadStarted(SyncState* state) {
     if (state != nullptr) {
@@ -603,6 +782,27 @@ int runSyncCommand(const std::string& port_name, const std::string& output_path)
 
     const LoggerMetadata metadata = loadLoggerMetadata();
 
+    sync_state.recording_start_epoch_ms =
+    metadata.recording_start_epoch_ms;
+
+    if (metadata.recording_start_epoch_ms > 0) {
+        std::cout
+            << "Recording start epoch: "
+            << metadata.recording_start_epoch_ms
+            << " ms\n";
+    } else {
+        std::cout
+            << "Recording metadata predates timestamp support. "
+            << "Elapsed time will begin at the first downloaded sample.\n";
+    }
+
+    if (metadata.sample_rate_hz > 0) {
+        std::cout
+            << "Recorded sample rate: "
+            << metadata.sample_rate_hz
+            << " Hz\n";
+    }
+
     std::cout << "Accel logger ID: "
               << metadata.accel_logger_id
               << "\n";
@@ -677,10 +877,10 @@ int runSyncCommand(const std::string& port_name, const std::string& output_path)
     std::cout << "IMU output: " << imu_path << "\n";
 
     if (!openCsvForAppend(
-            sync_state.imu_csv,
-            imu_path,
-            "epoch_ms,sensor,x,y,z\n"
-        )) {
+        sync_state.imu_csv,
+        imu_path,
+        "epoch_ms,elapsed_ms,sensor,x,y,z\n"
+    )) {
         return 3;
     }
 
@@ -690,7 +890,7 @@ int runSyncCommand(const std::string& port_name, const std::string& output_path)
         if (!openCsvForAppend(
                 sync_state.battery_csv,
                 battery_path,
-                "epoch_ms,voltage_mv,charge_percent\n"
+                "epoch_ms,elapsed_ms,voltage_mv,charge_percent\n"
             )) {
             sync_state.imu_csv.close();
             return 3;

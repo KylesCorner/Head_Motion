@@ -82,6 +82,12 @@ std::filesystem::path loggerMetadataPath() {
     );
 }
 
+std::int64_t currentEpochMs() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::system_clock::now().time_since_epoch()
+    ).count();
+}
+
 void pumpFor(headmotion::sdk::MetaWearSdkBridge& bridge, int total_ms) {
     const auto deadline =
         std::chrono::steady_clock::now() + std::chrono::milliseconds(total_ms);
@@ -157,32 +163,110 @@ void printCoreModuleInfo(MblMwMetaWearBoard* board) {
     printModuleImpl(board, MBL_MW_MODULE_GYRO, "GYRO");
 }
 
+// void saveLoggerMetadata(
+//     std::uint8_t accel_logger_id,
+//     std::uint8_t gyro_logger_id,
+//     bool battery_enabled,
+//     std::uint8_t battery_logger_id,
+//     std::uint8_t battery_timer_id,
+//     std::uint32_t battery_interval_seconds
+// ) {
+//     const auto path = loggerMetadataPath();
+
+//     std::ofstream out(path);
+
+//     if (!out) {
+//         throw std::runtime_error(
+//             "Failed to open logger metadata file: " + path.string()
+//         );
+//     }
+
+//     out << "accel_logger_id=" << static_cast<int>(accel_logger_id) << "\n";
+//     out << "gyro_logger_id=" << static_cast<int>(gyro_logger_id) << "\n";
+//     out << "battery_enabled=" << (battery_enabled ? 1 : 0) << "\n";
+
+//     if (battery_enabled) {
+//         out << "battery_logger_id=" << static_cast<int>(battery_logger_id) << "\n";
+//         out << "battery_timer_id=" << static_cast<int>(battery_timer_id) << "\n";
+//         out << "battery_interval_seconds=" << battery_interval_seconds << "\n";
+//     }
+// }
+
 void saveLoggerMetadata(
     std::uint8_t accel_logger_id,
     std::uint8_t gyro_logger_id,
     bool battery_enabled,
     std::uint8_t battery_logger_id,
     std::uint8_t battery_timer_id,
-    std::uint32_t battery_interval_seconds
+    std::uint32_t battery_interval_seconds,
+    std::int64_t recording_start_epoch_ms,
+    std::uint32_t sample_rate_hz
 ) {
-    const auto path = loggerMetadataPath();
-
-    std::ofstream out(path);
-
-    if (!out) {
+    if (recording_start_epoch_ms <= 0) {
         throw std::runtime_error(
-            "Failed to open logger metadata file: " + path.string()
+            "Refusing to save an invalid recording start timestamp"
         );
     }
 
-    out << "accel_logger_id=" << static_cast<int>(accel_logger_id) << "\n";
-    out << "gyro_logger_id=" << static_cast<int>(gyro_logger_id) << "\n";
-    out << "battery_enabled=" << (battery_enabled ? 1 : 0) << "\n";
+    const auto path = loggerMetadataPath();
+
+    if (path.has_parent_path()) {
+        std::filesystem::create_directories(
+            path.parent_path()
+        );
+    }
+
+    std::ofstream out(
+        path,
+        std::ios::out |
+        std::ios::trunc
+    );
+
+    if (!out) {
+        throw std::runtime_error(
+            "Failed to open logger metadata file: " +
+            path.string()
+        );
+    }
+
+    out
+        << "metadata_version=2\n"
+        << "recording_start_epoch_ms="
+        << recording_start_epoch_ms
+        << "\n"
+        << "sample_rate_hz="
+        << sample_rate_hz
+        << "\n"
+        << "accel_logger_id="
+        << static_cast<int>(accel_logger_id)
+        << "\n"
+        << "gyro_logger_id="
+        << static_cast<int>(gyro_logger_id)
+        << "\n"
+        << "battery_enabled="
+        << (battery_enabled ? 1 : 0)
+        << "\n";
 
     if (battery_enabled) {
-        out << "battery_logger_id=" << static_cast<int>(battery_logger_id) << "\n";
-        out << "battery_timer_id=" << static_cast<int>(battery_timer_id) << "\n";
-        out << "battery_interval_seconds=" << battery_interval_seconds << "\n";
+        out
+            << "battery_logger_id="
+            << static_cast<int>(battery_logger_id)
+            << "\n"
+            << "battery_timer_id="
+            << static_cast<int>(battery_timer_id)
+            << "\n"
+            << "battery_interval_seconds="
+            << battery_interval_seconds
+            << "\n";
+    }
+
+    out.flush();
+
+    if (!out) {
+        throw std::runtime_error(
+            "Failed to write logger metadata file: " +
+            path.string()
+        );
     }
 }
 
@@ -833,6 +917,23 @@ int runRecordStartCommand(
         }
     }
 
+    // std::cout << "Starting internal logging, overwrite=false\n";
+    // mbl_mw_logging_start(board, 0);
+    // pumpFor(bridge, 250);
+
+    /*
+    * Capture the host wall-clock time immediately before enabling onboard
+    * logging. The MMS+ has no calendar RTC, so this timestamp anchors the
+    * board-generated logging timestamps to the recording session.
+    */
+    const std::int64_t recording_start_epoch_ms =
+        currentEpochMs();
+
+    std::cout
+        << "Recording start epoch: "
+        << recording_start_epoch_ms
+        << " ms\n";
+
     std::cout << "Starting internal logging, overwrite=false\n";
     mbl_mw_logging_start(board, 0);
     pumpFor(bridge, 250);
@@ -852,13 +953,23 @@ int runRecordStartCommand(
         pumpFor(bridge, 250);
     }
 
+    // saveLoggerMetadata(
+    //     accel_logger_id,
+    //     gyro_logger_id,
+    //     battery_enabled,
+    //     battery_logger_id,
+    //     battery_timer_id,
+    //     battery_interval_seconds
+    // );
     saveLoggerMetadata(
-        accel_logger_id,
-        gyro_logger_id,
-        battery_enabled,
-        battery_logger_id,
-        battery_timer_id,
-        battery_interval_seconds
+    accel_logger_id,
+    gyro_logger_id,
+    battery_enabled,
+    battery_logger_id,
+    battery_timer_id,
+    battery_interval_seconds,
+    recording_start_epoch_ms,
+    static_cast<std::uint32_t>(sample_rate_hz)
     );
 
     std::cout << "Saved logger metadata: "

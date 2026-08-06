@@ -83,40 +83,134 @@ def format_duration(seconds: float) -> str:
 
 
 def read_csv(path: str) -> tuple[dict[str, SensorStats], int, int, int]:
-    required = {"epoch_ms", "sensor", "x", "y", "z"}
-
     stats: dict[str, SensorStats] = defaultdict(SensorStats)
+
     total_rows = 0
     global_min_epoch_ms: int | None = None
     global_max_epoch_ms: int | None = None
 
     with open(path, "r", newline="") as f:
-        reader = csv.DictReader(f)
+        reader = csv.reader(f)
 
-        if reader.fieldnames is None:
-            raise ValueError("CSV appears to be empty or missing a header.")
+        try:
+            raw_header = next(reader)
+        except StopIteration:
+            raise ValueError("CSV appears to be empty.")
 
-        fieldnames = {name.strip() for name in reader.fieldnames}
-        missing = required - fieldnames
-        if missing:
-            raise ValueError(f"CSV is missing required columns: {sorted(missing)}")
+        header = [
+            column.strip().lstrip("\ufeff")
+            for column in raw_header
+        ]
+
+        if "epoch_ms" not in header:
+            raise ValueError(
+                "CSV is missing the required epoch_ms column."
+            )
+
+        if "sensor" not in header:
+            raise ValueError(
+                "CSV is missing the required sensor column."
+            )
+
+        epoch_index = header.index("epoch_ms")
+        declared_sensor_index = header.index("sensor")
+
+        old_header = [
+            "epoch_ms",
+            "sensor",
+            "x",
+            "y",
+            "z",
+        ]
+
+        new_header = [
+            "epoch_ms",
+            "elapsed_ms",
+            "sensor",
+            "x",
+            "y",
+            "z",
+        ]
+
+        if header not in (old_header, new_header):
+            print(
+                "WARNING: Nonstandard CSV header detected: "
+                + ",".join(header),
+                file=sys.stderr,
+            )
+
+        stale_header_warning_printed = False
 
         for line_num, row in enumerate(reader, start=2):
+            row = [value.strip() for value in row]
+
+            if not row or not any(row):
+                continue
+
+            # Ignore repeated headers inside an appended CSV.
+            if row[0].lstrip("\ufeff") == "epoch_ms":
+                continue
+
+            sensor_index = declared_sensor_index
+
+            # Handle an old five-column header followed by new six-column rows.
+            if (
+                header == old_header
+                and len(row) == len(new_header)
+                and row[2] in ENTRIES_PER_SAMPLE
+            ):
+                sensor_index = 2
+
+                if not stale_header_warning_printed:
+                    print(
+                        "WARNING: Old five-column header with new "
+                        "six-column rows detected. Interpreting column 2 "
+                        "as elapsed_ms and column 3 as sensor.",
+                        file=sys.stderr,
+                    )
+
+                    stale_header_warning_printed = True
+
+            if epoch_index >= len(row):
+                raise ValueError(
+                    f"Missing epoch_ms value on line {line_num}: {row!r}"
+                )
+
             try:
-                epoch_ms = int(float(row["epoch_ms"]))
+                epoch_ms = int(float(row[epoch_index]))
             except ValueError:
                 raise ValueError(
-                    f"Invalid epoch_ms on line {line_num}: {row['epoch_ms']!r}"
+                    f"Invalid epoch_ms on line {line_num}: "
+                    f"{row[epoch_index]!r}"
                 )
 
-            sensor = row["sensor"].strip()
-
-            if sensor not in ENTRIES_PER_SAMPLE:
-                known = ", ".join(sorted(ENTRIES_PER_SAMPLE))
+            if sensor_index >= len(row):
                 raise ValueError(
-                    f"Unknown sensor type on line {line_num}: {sensor!r}. "
-                    f"Known sensor types: {known}"
+                    f"Missing sensor value on line {line_num}: {row!r}"
                 )
+
+            sensor = row[sensor_index]
+
+            # Recover from unusual column ordering when possible.
+            if sensor not in ENTRIES_PER_SAMPLE:
+                sensor_matches = [
+                    value
+                    for value in row
+                    if value in ENTRIES_PER_SAMPLE
+                ]
+
+                if len(sensor_matches) == 1:
+                    sensor = sensor_matches[0]
+                else:
+                    known = ", ".join(
+                        sorted(ENTRIES_PER_SAMPLE)
+                    )
+
+                    raise ValueError(
+                        f"Unknown sensor type on line {line_num}: "
+                        f"{sensor!r}. Known sensor types: {known}. "
+                        f"Full row: {row!r}"
+                    )
 
             stats[sensor].add(epoch_ms)
             total_rows += 1
@@ -125,16 +219,84 @@ def read_csv(path: str) -> tuple[dict[str, SensorStats], int, int, int]:
                 global_min_epoch_ms = epoch_ms
                 global_max_epoch_ms = epoch_ms
             else:
-                global_min_epoch_ms = min(global_min_epoch_ms, epoch_ms)
-                global_max_epoch_ms = max(global_max_epoch_ms, epoch_ms)
+                global_min_epoch_ms = min(
+                    global_min_epoch_ms,
+                    epoch_ms,
+                )
+
+                global_max_epoch_ms = max(
+                    global_max_epoch_ms,
+                    epoch_ms,
+                )
 
     if total_rows == 0:
-        raise ValueError("CSV has a header but no data rows.")
+        raise ValueError(
+            "CSV has a header but no data rows."
+        )
 
     assert global_min_epoch_ms is not None
     assert global_max_epoch_ms is not None
 
-    return stats, total_rows, global_min_epoch_ms, global_max_epoch_ms
+    return (
+        stats,
+        total_rows,
+        global_min_epoch_ms,
+        global_max_epoch_ms,
+    )
+
+# def read_csv(path: str) -> tuple[dict[str, SensorStats], int, int, int]:
+#     required = {"epoch_ms", "sensor", "x", "y", "z"}
+
+#     stats: dict[str, SensorStats] = defaultdict(SensorStats)
+#     total_rows = 0
+#     global_min_epoch_ms: int | None = None
+#     global_max_epoch_ms: int | None = None
+
+#     with open(path, "r", newline="") as f:
+#         reader = csv.DictReader(f)
+
+#         if reader.fieldnames is None:
+#             raise ValueError("CSV appears to be empty or missing a header.")
+
+#         fieldnames = {name.strip() for name in reader.fieldnames}
+#         missing = required - fieldnames
+#         if missing:
+#             raise ValueError(f"CSV is missing required columns: {sorted(missing)}")
+
+#         for line_num, row in enumerate(reader, start=2):
+#             try:
+#                 epoch_ms = int(float(row["epoch_ms"]))
+#             except ValueError:
+#                 raise ValueError(
+#                     f"Invalid epoch_ms on line {line_num}: {row['epoch_ms']!r}"
+#                 )
+
+#             sensor = row["sensor"].strip()
+
+#             if sensor not in ENTRIES_PER_SAMPLE:
+#                 known = ", ".join(sorted(ENTRIES_PER_SAMPLE))
+#                 raise ValueError(
+#                     f"Unknown sensor type on line {line_num}: {sensor!r}. "
+#                     f"Known sensor types: {known}"
+#                 )
+
+#             stats[sensor].add(epoch_ms)
+#             total_rows += 1
+
+#             if global_min_epoch_ms is None:
+#                 global_min_epoch_ms = epoch_ms
+#                 global_max_epoch_ms = epoch_ms
+#             else:
+#                 global_min_epoch_ms = min(global_min_epoch_ms, epoch_ms)
+#                 global_max_epoch_ms = max(global_max_epoch_ms, epoch_ms)
+
+#     if total_rows == 0:
+#         raise ValueError("CSV has a header but no data rows.")
+
+#     assert global_min_epoch_ms is not None
+#     assert global_max_epoch_ms is not None
+
+#     return stats, total_rows, global_min_epoch_ms, global_max_epoch_ms
 
 
 def main() -> int:
