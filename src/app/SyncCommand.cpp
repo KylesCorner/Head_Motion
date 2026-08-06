@@ -91,9 +91,19 @@ struct LoggerMetadata {
 //     std::atomic<std::uint64_t> unhandled_entries{0};
 // };
 
+struct TimedVectorSample {
+    std::int64_t epoch_ms = 0;
+    float x = 0.0f;
+    float y = 0.0f;
+    float z = 0.0f;
+};
+
 struct SyncState {
     std::ofstream imu_csv;
+    std::ofstream xsens_csv;
     std::ofstream battery_csv;
+    std::ofstream xsens_accel_temp;
+    std::ofstream xsens_gyro_temp;
     std::mutex csv_mutex;
 
     /*
@@ -113,14 +123,23 @@ struct SyncState {
     std::atomic<std::uint32_t> total_entries{0};
 
     std::atomic<std::uint64_t> imu_rows_written{0};
+    std::atomic<std::uint64_t> xsens_rows_written{0};
     std::atomic<std::uint64_t> battery_rows_written{0};
+    std::uint64_t xsens_packet_counter = 0;
+    std::uint64_t xsens_unmatched_accel = 0;
+    std::uint64_t xsens_unmatched_gyro = 0;
+    std::uint32_t xsens_pair_tolerance_ms = 20;
+    std::atomic<bool> xsens_temp_write_failed{false};
     std::atomic<std::uint64_t> unknown_entries{0};
     std::atomic<std::uint64_t> unhandled_entries{0};
 };
 
 struct CsvOutputPaths {
     std::filesystem::path imu;
+    std::filesystem::path xsens;
     std::filesystem::path battery;
+    std::filesystem::path xsens_accel_temp;
+    std::filesystem::path xsens_gyro_temp;
 };
 
 CsvOutputPaths chooseUnusedCsvOutputPaths(
@@ -134,15 +153,21 @@ CsvOutputPaths chooseUnusedCsvOutputPaths(
 
         CsvOutputPaths candidate{
             output_dir / ("imu" + suffix + ".csv"),
-            output_dir / ("battery" + suffix + ".csv")
+            output_dir / ("imu_xsens" + suffix + ".csv"),
+            output_dir / ("battery" + suffix + ".csv"),
+            output_dir / (".imu_xsens_accel" + suffix + ".bin"),
+            output_dir / (".imu_xsens_gyro" + suffix + ".bin")
         };
 
         /*
-         * Treat either file as a collision so IMU and battery files always
-         * retain the same session number.
+         * Treat any related file as a collision so all outputs retain the
+         * same session number.
          */
         if (!std::filesystem::exists(candidate.imu) &&
-            !std::filesystem::exists(candidate.battery)) {
+            !std::filesystem::exists(candidate.xsens) &&
+            !std::filesystem::exists(candidate.battery) &&
+            !std::filesystem::exists(candidate.xsens_accel_temp) &&
+            !std::filesystem::exists(candidate.xsens_gyro_temp)) {
             return candidate;
         }
     }
@@ -483,7 +508,215 @@ void writeImuDataRow(
         return;
     }
 
+    TimedVectorSample sample;
+    sample.epoch_ms = timestamp.epoch_ms;
+    sample.x = value->x;
+    sample.y = value->y;
+    sample.z = value->z;
+
+    std::ofstream* temp_stream = nullptr;
+
+    if (std::strcmp(sensor, "accel_g") == 0) {
+        temp_stream = &state->xsens_accel_temp;
+    } else if (std::strcmp(sensor, "gyro_dps") == 0) {
+        temp_stream = &state->xsens_gyro_temp;
+    }
+
+    if (temp_stream != nullptr) {
+        temp_stream->write(
+            reinterpret_cast<const char*>(&sample),
+            sizeof(sample)
+        );
+
+        if (!*temp_stream) {
+            state->xsens_temp_write_failed = true;
+            std::cerr
+                << "Failed to write temporary Xsens pairing data for "
+                << sensor
+                << "\n";
+        }
+    }
+
     state->imu_rows_written++;
+}
+
+bool readTimedVectorSample(
+    std::ifstream& stream,
+    TimedVectorSample& sample
+) {
+    stream.read(
+        reinterpret_cast<char*>(&sample),
+        sizeof(sample)
+    );
+
+    if (stream.gcount() == 0 && stream.eof()) {
+        return false;
+    }
+
+    if (stream.gcount() != static_cast<std::streamsize>(sizeof(sample))) {
+        throw std::runtime_error(
+            "Truncated temporary Xsens pairing file"
+        );
+    }
+
+    return true;
+}
+
+std::uint64_t timestampDifferenceMs(
+    std::int64_t lhs,
+    std::int64_t rhs
+) {
+    return lhs >= rhs
+        ? static_cast<std::uint64_t>(lhs - rhs)
+        : static_cast<std::uint64_t>(rhs - lhs);
+}
+
+bool writeXsensWideRow(
+    SyncState& state,
+    const TimedVectorSample& accel,
+    const TimedVectorSample& gyro
+) {
+    const RowTimestamp timestamp =
+        resolveRowTimestampLocked(
+            state,
+            gyro.epoch_ms
+        );
+
+    state.xsens_csv
+        << state.xsens_packet_counter++
+        << ","
+        << timestamp.epoch_ms
+        << ",0,0,0,"
+        << accel.x
+        << ","
+        << accel.y
+        << ","
+        << accel.z
+        << ","
+        << gyro.x
+        << ","
+        << gyro.y
+        << ","
+        << gyro.z
+        << ","
+        << timestamp.elapsed_ms
+        << "\n";
+
+    if (!state.xsens_csv) {
+        std::cerr
+            << "Failed to write Xsens-compatible CSV row\n";
+        return false;
+    }
+
+    state.xsens_rows_written++;
+    return true;
+}
+
+bool finalizeXsensCsv(
+    SyncState& state,
+    const CsvOutputPaths& paths
+) {
+    {
+        std::lock_guard<std::mutex> lock(state.csv_mutex);
+
+        state.xsens_accel_temp.flush();
+        state.xsens_accel_temp.close();
+        state.xsens_gyro_temp.flush();
+        state.xsens_gyro_temp.close();
+
+        if (state.xsens_temp_write_failed.load()) {
+            std::cerr
+                << "Cannot build Xsens-compatible CSV because temporary "
+                << "IMU pairing data could not be written.\n";
+            return false;
+        }
+    }
+
+    std::ifstream accel_in(
+        paths.xsens_accel_temp,
+        std::ios::in | std::ios::binary
+    );
+    std::ifstream gyro_in(
+        paths.xsens_gyro_temp,
+        std::ios::in | std::ios::binary
+    );
+
+    if (!accel_in || !gyro_in) {
+        std::cerr
+            << "Failed to open temporary IMU pairing files\n";
+        return false;
+    }
+
+    TimedVectorSample accel;
+    TimedVectorSample gyro;
+
+    bool have_accel = readTimedVectorSample(accel_in, accel);
+    bool have_gyro = readTimedVectorSample(gyro_in, gyro);
+
+    while (have_accel && have_gyro) {
+        const std::uint64_t difference_ms =
+            timestampDifferenceMs(
+                accel.epoch_ms,
+                gyro.epoch_ms
+            );
+
+        if (difference_ms <= state.xsens_pair_tolerance_ms) {
+            if (!writeXsensWideRow(state, accel, gyro)) {
+                return false;
+            }
+
+            have_accel = readTimedVectorSample(accel_in, accel);
+            have_gyro = readTimedVectorSample(gyro_in, gyro);
+            continue;
+        }
+
+        if (accel.epoch_ms < gyro.epoch_ms) {
+            state.xsens_unmatched_accel++;
+            have_accel = readTimedVectorSample(accel_in, accel);
+        } else {
+            state.xsens_unmatched_gyro++;
+            have_gyro = readTimedVectorSample(gyro_in, gyro);
+        }
+    }
+
+    while (have_accel) {
+        state.xsens_unmatched_accel++;
+        have_accel = readTimedVectorSample(accel_in, accel);
+    }
+
+    while (have_gyro) {
+        state.xsens_unmatched_gyro++;
+        have_gyro = readTimedVectorSample(gyro_in, gyro);
+    }
+
+    accel_in.close();
+    gyro_in.close();
+
+    std::error_code remove_error;
+    std::filesystem::remove(paths.xsens_accel_temp, remove_error);
+
+    if (remove_error) {
+        std::cerr
+            << "WARNING: failed to remove temporary file "
+            << paths.xsens_accel_temp
+            << ": "
+            << remove_error.message()
+            << "\n";
+    }
+
+    remove_error.clear();
+    std::filesystem::remove(paths.xsens_gyro_temp, remove_error);
+
+    if (remove_error) {
+        std::cerr
+            << "WARNING: failed to remove temporary file "
+            << paths.xsens_gyro_temp
+            << ": "
+            << remove_error.message()
+            << "\n";
+    }
+
+    return true;
 }
 
 void writeBatteryDataRow(
@@ -710,6 +943,21 @@ void closeCsvs(SyncState& state, bool battery_enabled) {
         state.imu_csv.close();
     }
 
+    if (state.xsens_csv.is_open()) {
+        state.xsens_csv.flush();
+        state.xsens_csv.close();
+    }
+
+    if (state.xsens_accel_temp.is_open()) {
+        state.xsens_accel_temp.flush();
+        state.xsens_accel_temp.close();
+    }
+
+    if (state.xsens_gyro_temp.is_open()) {
+        state.xsens_gyro_temp.flush();
+        state.xsens_gyro_temp.close();
+    }
+
     if (battery_enabled && state.battery_csv.is_open()) {
         state.battery_csv.flush();
         state.battery_csv.close();
@@ -801,7 +1049,16 @@ int runSyncCommand(const std::string& port_name, const std::string& output_path)
             << "Recorded sample rate: "
             << metadata.sample_rate_hz
             << " Hz\n";
+
+        sync_state.xsens_pair_tolerance_ms =
+            (1000U + metadata.sample_rate_hz - 1U) /
+            metadata.sample_rate_hz;
     }
+
+    std::cout
+        << "Xsens accel/gyro pairing tolerance: "
+        << sync_state.xsens_pair_tolerance_ms
+        << " ms\n";
 
     std::cout << "Accel logger ID: "
               << metadata.accel_logger_id
@@ -872,6 +1129,7 @@ int runSyncCommand(const std::string& port_name, const std::string& output_path)
         chooseUnusedCsvOutputPaths(output_dir);
 
     const auto& imu_path = csv_paths.imu;
+    const auto& xsens_path = csv_paths.xsens;
     const auto& battery_path = csv_paths.battery;
 
     std::cout << "IMU output: " << imu_path << "\n";
@@ -884,6 +1142,35 @@ int runSyncCommand(const std::string& port_name, const std::string& output_path)
         return 3;
     }
 
+    std::cout << "Xsens-compatible output: " << xsens_path << "\n";
+
+    if (!openCsvForAppend(
+            sync_state.xsens_csv,
+            xsens_path,
+            "PacketCounter,SampleTimeFine,Euler_X,Euler_Y,Euler_Z,"
+            "Acc_X,Acc_Y,Acc_Z,Gyr_X,Gyr_Y,Gyr_Z,elapsed_ms\n"
+        )) {
+        sync_state.imu_csv.close();
+        return 3;
+    }
+
+    sync_state.xsens_accel_temp.open(
+        csv_paths.xsens_accel_temp,
+        std::ios::out | std::ios::binary | std::ios::trunc
+    );
+    sync_state.xsens_gyro_temp.open(
+        csv_paths.xsens_gyro_temp,
+        std::ios::out | std::ios::binary | std::ios::trunc
+    );
+
+    if (!sync_state.xsens_accel_temp ||
+        !sync_state.xsens_gyro_temp) {
+        std::cerr
+            << "Failed to open temporary IMU pairing files\n";
+        closeCsvs(sync_state, false);
+        return 3;
+    }
+
     if (metadata.battery_enabled) {
         std::cout << "Battery output: " << battery_path << "\n";
 
@@ -893,6 +1180,7 @@ int runSyncCommand(const std::string& port_name, const std::string& output_path)
                 "epoch_ms,elapsed_ms,voltage_mv,charge_percent\n"
             )) {
             sync_state.imu_csv.close();
+            sync_state.xsens_csv.close();
             return 3;
         }
     }
@@ -1162,6 +1450,11 @@ int runSyncCommand(const std::string& port_name, const std::string& output_path)
         std::this_thread::sleep_for(1ms);
     }
 
+    if (!finalizeXsensCsv(sync_state, csv_paths)) {
+        closeCsvs(sync_state, metadata.battery_enabled);
+        return 6;
+    }
+
     closeCsvs(sync_state, metadata.battery_enabled);
 
     if (printed_progress_line) {
@@ -1177,6 +1470,18 @@ int runSyncCommand(const std::string& port_name, const std::string& output_path)
     std::cout << "Sync complete.\n";
     std::cout << "IMU rows written: "
               << sync_state.imu_rows_written.load()
+              << "\n";
+
+    std::cout << "Xsens-compatible rows written: "
+              << sync_state.xsens_rows_written.load()
+              << "\n";
+
+    std::cout << "Unmatched accel samples: "
+              << sync_state.xsens_unmatched_accel
+              << "\n";
+
+    std::cout << "Unmatched gyro samples: "
+              << sync_state.xsens_unmatched_gyro
               << "\n";
 
     if (metadata.battery_enabled) {
@@ -1195,6 +1500,10 @@ int runSyncCommand(const std::string& port_name, const std::string& output_path)
 
     std::cout << "IMU CSV: "
               << imu_path
+              << "\n";
+
+    std::cout << "Xsens-compatible CSV: "
+              << xsens_path
               << "\n";
 
     if (metadata.battery_enabled) {
