@@ -11,6 +11,9 @@ project(headmotion_client
 
 option(HEADMOTION_BUILD_TESTS "Build unit tests" OFF)
 
+option(HEADMOTION_BUILD_TESTS "Build unit tests" OFF)
+option(HEADMOTION_BUILD_GUI "Build FLTK GUI" ON)
+
 set(HEADMOTION_SERIAL_BACKEND "native" CACHE STRING
     "Serial backend: native or libserialport"
 )
@@ -372,6 +375,52 @@ target_compile_definitions(mmsctl PRIVATE
 )
 
 target_compile_features(mmsctl PRIVATE cxx_std_20)
+
+# ============================================================
+# FLTK GUI
+# ============================================================
+
+if(HEADMOTION_BUILD_GUI)
+
+    find_package(FLTK CONFIG REQUIRED)
+
+    add_executable(headmotion_gui
+        src/gui/main.cpp
+        src/gui/MainWindow.cpp
+    )
+
+    target_include_directories(headmotion_gui PRIVATE
+        include
+    )
+
+    target_link_libraries(headmotion_gui PRIVATE
+        headmotion_app
+        fltk::fltk
+    )
+
+    target_compile_features(headmotion_gui PRIVATE
+        cxx_std_20
+    )
+
+    if(MSVC)
+        target_compile_options(headmotion_gui PRIVATE /W4)
+    else()
+        target_compile_options(headmotion_gui PRIVATE
+            -Wall
+            -Wextra
+            -Wpedantic
+        )
+    endif()
+
+    # Later, when the Windows backend exists, this prevents
+    # a separate console window from appearing.
+    if(WIN32)
+        set_target_properties(headmotion_gui PROPERTIES
+            WIN32_EXECUTABLE TRUE
+        )
+    endif()
+
+endif()
 
 # ============================================================
 # Warnings

@@ -11,6 +11,7 @@
  * logger metadata containing the logger IDs.
  */
 
+#include "headmotion/app/Commands.hpp"
 #include "headmotion/metawear/MetaWearUsbTransport.hpp"
 #include "headmotion/sdk/MetaWearSdkBridge.hpp"
 #include "headmotion/session/BoardStateStore.hpp"
@@ -36,6 +37,7 @@ extern "C" {
 #include <string>
 #include <thread>
 #include <optional>
+ #include <utility>
 
 namespace headmotion::app {
 
@@ -105,6 +107,9 @@ struct SyncState {
     std::ofstream xsens_accel_temp;
     std::ofstream xsens_gyro_temp;
     std::mutex csv_mutex;
+
+    headmotion::app::SyncProgressCallback
+    progress_callback;
 
     /*
      * New recordings contain recording_start_epoch_ms.
@@ -880,27 +885,62 @@ void onBatteryLoggerData(void* context, const MblMwData* data) {
 //     writeBatteryDataRow(static_cast<SyncState*>(context), data);
 // }
 
+// void onProgressUpdate(
+//     void* context,
+//     std::uint32_t entries_left,
+//     std::uint32_t total_entries
+// ) {
+//     auto* state = static_cast<SyncState*>(context);
+
+//     if (state == nullptr) {
+//         return;
+//     }
+
+//     // std::cerr
+//     // << "\n[progress callback] entries_left="
+//     // << entries_left
+//     // << ", total_entries="
+//     // << total_entries
+//     // << "\n";
+
+//     state->download_started = true;
+//     state->entries_left = entries_left;
+//     state->total_entries = total_entries;
+
+//     if (entries_left == 0) {
+//         state->download_done = true;
+//     }
+// }
+
 void onProgressUpdate(
     void* context,
     std::uint32_t entries_left,
     std::uint32_t total_entries
 ) {
-    auto* state = static_cast<SyncState*>(context);
+    auto* state =
+        static_cast<SyncState*>(context);
 
     if (state == nullptr) {
         return;
     }
 
-    // std::cerr
-    // << "\n[progress callback] entries_left="
-    // << entries_left
-    // << ", total_entries="
-    // << total_entries
-    // << "\n";
-
     state->download_started = true;
     state->entries_left = entries_left;
     state->total_entries = total_entries;
+
+    if (state->progress_callback) {
+        try {
+            state->progress_callback(
+                entries_left,
+                total_entries
+            );
+        } catch (...) {
+            /*
+             * Never allow a UI callback exception to
+             * unwind through the MetaWear C callback.
+             */
+        }
+    }
 
     if (entries_left == 0) {
         state->download_done = true;
@@ -976,7 +1016,11 @@ std::uint64_t totalRowsWritten(const SyncState& state) {
 * SDK logger deserialization. This does not scale with CSV rows and is not
 * believed to be the cause of long-download instability.
 */
-int runSyncCommand(const std::string& port_name, const std::string& output_path) {
+int runSyncCommand(
+    const std::string& port_name,
+    const std::string& output_path,
+    SyncProgressCallback progress_callback
+) {
     using namespace std::chrono_literals;
 
     /*
@@ -984,6 +1028,8 @@ int runSyncCommand(const std::string& port_name, const std::string& output_path)
      * can hold callback context pointers into them.
      */
     SyncState sync_state;
+    sync_state.progress_callback =
+        std::move(progress_callback);
     MblMwLogDownloadHandler download_handler = {};
 
     headmotion::transport::SerialConfig config;
