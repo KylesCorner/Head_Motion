@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=HeadMotion
+Comment=MMS+ recording and data download utility
+Exec=headmotion_gui
+Icon=headmotion
+Terminal=false
+Categories=Science;Utility;

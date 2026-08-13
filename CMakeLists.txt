@@ -457,3 +457,95 @@ endif()
 #     add_subdirectory(tests)
 # endif()
 # ============================================================
+# ============================================================
+# Installation
+# ============================================================
+
+include(GNUInstallDirs)
+
+install(
+    TARGETS
+        headmotion_gui
+        mmsctl
+    RUNTIME DESTINATION
+        ${CMAKE_INSTALL_BINDIR}
+)
+
+if(UNIX AND NOT APPLE)
+    install(
+        FILES
+            packaging/linux/headmotion.desktop
+        DESTINATION
+            share/applications
+    )
+
+    install(
+        FILES
+            packaging/linux/headmotion.png
+        DESTINATION
+            share/icons/hicolor/256x256/apps
+    )
+endif()
+
+# ============================================================
+# Packaging
+# ============================================================
+
+set(CPACK_PACKAGE_NAME "HeadMotion")
+set(CPACK_PACKAGE_VENDOR "HeadMotion")
+
+set(
+    CPACK_PACKAGE_DESCRIPTION_SUMMARY
+    "MMS+ recording and data download utility"
+)
+
+set(
+    CPACK_PACKAGE_VERSION
+    "${PROJECT_VERSION}"
+)
+
+set(
+    CPACK_PACKAGE_INSTALL_DIRECTORY
+    "HeadMotion"
+)
+
+if(WIN32)
+
+    set(CPACK_GENERATOR "NSIS")
+
+    set(
+        CPACK_NSIS_DISPLAY_NAME
+        "HeadMotion"
+    )
+
+    set(
+        CPACK_NSIS_PACKAGE_NAME
+        "HeadMotion"
+    )
+
+    set(
+        CPACK_NSIS_ENABLE_UNINSTALL_BEFORE_INSTALL
+        ON
+    )
+
+elseif(APPLE)
+
+    set(CPACK_GENERATOR "DragNDrop")
+
+elseif(UNIX)
+
+    set(CPACK_GENERATOR "AppImage")
+
+    set(
+        CPACK_PACKAGE_ICON
+        "headmotion.png"
+    )
+
+    set(
+        CPACK_APPIMAGE_DESKTOP_FILE
+        "headmotion.desktop"
+    )
+
+endif()
+
+include(CPack)
