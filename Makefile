@@ -24,6 +24,9 @@ CMAKE ?= cmake
 CTEST ?= ctest
 CPACK ?= cpack
 
+CONTAINER_ENGINE ?= docker
+
+
 # ============================================================
 # Build directories
 # ============================================================
@@ -36,6 +39,11 @@ RELEASE_APP := $(RELEASE_BUILD_DIR)/mmsctl
 
 DEBUG_GUI   := $(DEBUG_BUILD_DIR)/headmotion_gui
 RELEASE_GUI := $(RELEASE_BUILD_DIR)/headmotion_gui
+
+BOOKWORM_BUILDER_IMAGE := headmotion-bookworm-builder
+BOOKWORM_BUILD_DIR := build/linux-bookworm-release
+
+DIST_DIR := dist
 
 # ============================================================
 # Targets
@@ -100,12 +108,59 @@ clean-release:
 # Packaging
 # ============================================================
 
-appimage: release
-	rm -rf $(RELEASE_BUILD_DIR)/_CPack_Packages
-	cd $(RELEASE_BUILD_DIR) && $(CPACK) -G AppImage
+# appimage: release
+# 	rm -rf $(RELEASE_BUILD_DIR)/_CPack_Packages
+# 	cd $(RELEASE_BUILD_DIR) && $(CPACK) -G AppImage
+# 	@echo ""
+# 	@echo "AppImage created:"
+# 	@find $(RELEASE_BUILD_DIR) \
+# 		-maxdepth 1 \
+# 		-type f \
+# 		-name '*.AppImage' \
+# 		-print
+
+# ============================================================
+# Debian 12 AppImage
+#
+# Build the distributable AppImage inside Debian 12 so the
+# resulting binary is compatible with Debian 12 and newer.
+# ============================================================
+
+appimage:
+	$(CONTAINER_ENGINE) build \
+		-f packaging/linux/Dockerfile.bookworm \
+		-t $(BOOKWORM_BUILDER_IMAGE) \
+		.
+
+	$(CONTAINER_ENGINE) run --rm \
+		--user "$$(id -u):$$(id -g)" \
+		-e HOME=/tmp \
+		-v "$$(pwd):/workspace" \
+		-v "$$(pwd)/../MetaWear-SDK-Cpp:/workspace/external/MetaWear-SDK-Cpp:ro" \
+		-w /workspace \
+		$(BOOKWORM_BUILDER_IMAGE) \
+		/bin/bash -c '\
+			set -e; \
+			rm -rf $(BOOKWORM_BUILD_DIR); \
+			cmake \
+				-S . \
+				-B $(BOOKWORM_BUILD_DIR) \
+				-G Ninja \
+				-DCMAKE_BUILD_TYPE=Release \
+				-DHEADMOTION_SERIAL_BACKEND=native \
+				-DHEADMOTION_BUILD_GUI=ON; \
+			cmake --build $(BOOKWORM_BUILD_DIR); \
+			rm -rf $(BOOKWORM_BUILD_DIR)/_CPack_Packages; \
+			cd $(BOOKWORM_BUILD_DIR); \
+			cpack -G AppImage; \
+		'
+
+	mkdir -p $(DIST_DIR)
+	cp $(BOOKWORM_BUILD_DIR)/*.AppImage $(DIST_DIR)/
+
 	@echo ""
-	@echo "AppImage created:"
-	@find $(RELEASE_BUILD_DIR) \
+	@echo "Debian 12 compatible AppImage:"
+	@find $(DIST_DIR) \
 		-maxdepth 1 \
 		-type f \
 		-name '*.AppImage' \

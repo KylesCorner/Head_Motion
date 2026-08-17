@@ -1,0 +1,67 @@
+FROM debian:12-slim
+
+ARG CMAKE_VERSION=4.4.2
+ARG APPIMAGETOOL_VERSION=1.9.1
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV APPIMAGE_EXTRACT_AND_RUN=1
+
+# ------------------------------------------------------------
+# Debian 12 build environment
+# ------------------------------------------------------------
+
+# RUN apt-get update && \
+#     apt-get install -y --no-install-recommends \
+#         build-essential \
+#         ninja-build \
+#         git \
+#         curl \
+#         ca-certificates \
+#         patchelf \
+#         file \
+#         squashfs-tools \
+#         libfltk1.3-dev && \
+#     rm -rf /var/lib/apt/lists/*
+
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+        build-essential \
+        ninja-build \
+        git \
+        curl \
+        ca-certificates \
+        patchelf \
+        file \
+        squashfs-tools \
+        libfltk1.3-dev \
+        fluid && \
+    rm -rf /var/lib/apt/lists/*
+# ------------------------------------------------------------
+# Modern CMake
+#
+# Debian 12's system CMake is old enough to build HeadMotion,
+# but too old for CPack's AppImage generator.
+# ------------------------------------------------------------
+
+RUN curl -fsSL \
+        "https://cmake.org/files/v4.4/cmake-${CMAKE_VERSION}-linux-x86_64.tar.gz" \
+        -o /tmp/cmake.tar.gz && \
+    mkdir -p /opt/cmake && \
+    tar \
+        --strip-components=1 \
+        -xzf /tmp/cmake.tar.gz \
+        -C /opt/cmake && \
+    rm /tmp/cmake.tar.gz
+
+ENV PATH="/opt/cmake/bin:${PATH}"
+
+# ------------------------------------------------------------
+# appimagetool
+# ------------------------------------------------------------
+
+RUN curl -fsSL \
+        "https://github.com/AppImage/appimagetool/releases/download/${APPIMAGETOOL_VERSION}/appimagetool-x86_64.AppImage" \
+        -o /usr/local/bin/appimagetool && \
+    chmod +x /usr/local/bin/appimagetool
+
+WORKDIR /workspace

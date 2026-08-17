@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.22)
 
 project(headmotion_client
-    VERSION 0.1.0
+    VERSION 0.1.1
     LANGUAGES C CXX
 )
 
@@ -400,6 +400,19 @@ if(HEADMOTION_BUILD_GUI)
 
     find_package(FLTK CONFIG REQUIRED)
 
+    # FLTK 1.4 uses the namespaced target fltk::fltk.
+    # FLTK 1.3, as shipped by Debian 12, uses fltk.
+    if(TARGET fltk::fltk)
+        set(HEADMOTION_FLTK_TARGET fltk::fltk)
+    elseif(TARGET fltk)
+        set(HEADMOTION_FLTK_TARGET fltk)
+    else()
+        message(FATAL_ERROR
+            "FLTK was found, but no supported FLTK target exists. "
+            "Expected fltk::fltk or fltk."
+        )
+    endif()
+
     add_executable(headmotion_gui
         src/gui/main.cpp
         src/gui/MainWindow.cpp
@@ -409,9 +422,17 @@ if(HEADMOTION_BUILD_GUI)
         include
     )
 
+    # Older FLTK installations may expose include directories
+    # through this variable instead of the imported target.
+    if(FLTK_INCLUDE_DIRS)
+        target_include_directories(headmotion_gui PRIVATE
+            ${FLTK_INCLUDE_DIRS}
+        )
+    endif()
+
     target_link_libraries(headmotion_gui PRIVATE
         headmotion_app
-        fltk::fltk
+        ${HEADMOTION_FLTK_TARGET}
     )
 
     target_compile_features(headmotion_gui PRIVATE
@@ -428,8 +449,6 @@ if(HEADMOTION_BUILD_GUI)
         )
     endif()
 
-    # Later, when the Windows backend exists, this prevents
-    # a separate console window from appearing.
     if(WIN32)
         set_target_properties(headmotion_gui PROPERTIES
             WIN32_EXECUTABLE TRUE
@@ -501,6 +520,70 @@ if(UNIX AND NOT APPLE)
         DESTINATION
             share/icons/hicolor/256x256/apps
     )
+endif()
+
+
+# ============================================================
+# Linux AppImage runtime dependencies
+# ============================================================
+
+if(UNIX AND NOT APPLE AND HEADMOTION_BUILD_GUI)
+
+    install(CODE [[
+        file(GET_RUNTIME_DEPENDENCIES
+            EXECUTABLES
+                $<TARGET_FILE:headmotion_gui>
+                $<TARGET_FILE:mmsctl>
+
+            RESOLVED_DEPENDENCIES_VAR
+                HEADMOTION_RUNTIME_DEPS
+
+            UNRESOLVED_DEPENDENCIES_VAR
+                HEADMOTION_UNRESOLVED_DEPS
+
+            POST_EXCLUDE_REGEXES
+                ".*/libc\\.so\\..*"
+                ".*/ld-linux.*\\.so.*"
+                ".*/libm\\.so\\..*"
+                ".*/libpthread\\.so\\..*"
+                ".*/libdl\\.so\\..*"
+                ".*/librt\\.so\\..*"
+                ".*/libresolv\\.so\\..*"
+        )
+
+        file(MAKE_DIRECTORY
+            "${CMAKE_INSTALL_PREFIX}/lib"
+        )
+
+        foreach(DEP ${HEADMOTION_RUNTIME_DEPS})
+
+            file(COPY
+                "${DEP}"
+                DESTINATION
+                "${CMAKE_INSTALL_PREFIX}/lib"
+            )
+
+            file(REAL_PATH
+                "${DEP}"
+                RESOLVED_DEP
+            )
+
+            file(COPY
+                "${RESOLVED_DEP}"
+                DESTINATION
+                "${CMAKE_INSTALL_PREFIX}/lib"
+            )
+
+        endforeach()
+
+        if(HEADMOTION_UNRESOLVED_DEPS)
+            message(WARNING
+                "Unresolved AppImage dependencies: "
+                "${HEADMOTION_UNRESOLVED_DEPS}"
+            )
+        endif()
+    ]])
+
 endif()
 
 # ============================================================
