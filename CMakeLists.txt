@@ -10,26 +10,42 @@ project(headmotion_client
 # ============================================================
 
 option(HEADMOTION_BUILD_TESTS "Build unit tests" OFF)
-
-option(HEADMOTION_BUILD_TESTS "Build unit tests" OFF)
 option(HEADMOTION_BUILD_GUI "Build FLTK GUI" ON)
 
-set(HEADMOTION_SERIAL_BACKEND "native" CACHE STRING
+set(
+    HEADMOTION_SERIAL_BACKEND
+    "native"
+    CACHE STRING
     "Serial backend: native or libserialport"
 )
 
-set_property(CACHE HEADMOTION_SERIAL_BACKEND PROPERTY STRINGS
-    native
-    libserialport
+set_property(
+    CACHE HEADMOTION_SERIAL_BACKEND
+    PROPERTY STRINGS
+        native
+        libserialport
 )
 
-set(METAWEAR_SDK_DIR
-    "/home/kyle/Collage/HeadMotion/code/MetaWear-SDK-Cpp"
+set(
+    METAWEAR_SDK_DIR
+    "${CMAKE_SOURCE_DIR}/external/MetaWear-SDK-Cpp"
     CACHE PATH
     "Path to MetaWear-SDK-Cpp"
 )
 
-# Your code is C++20.
+if(NOT EXISTS "${METAWEAR_SDK_DIR}/CMakeLists.txt")
+    message(FATAL_ERROR
+        "MetaWear SDK not found at:\n"
+        "  ${METAWEAR_SDK_DIR}\n\n"
+        "Clone it with:\n"
+        "  mkdir -p external\n"
+        "  git clone https://github.com/mbientlab/MetaWear-SDK-Cpp.git "
+        "external/MetaWear-SDK-Cpp\n"
+        "  cd external/MetaWear-SDK-Cpp\n"
+        "  git submodule update --init --recursive"
+    )
+endif()
+
 # The MetaWear SDK may force its own older C++ settings internally.
 # We explicitly set C++20 per target below for our own targets.
 set(CMAKE_CXX_STANDARD 20)
