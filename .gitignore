@@ -5,6 +5,7 @@ cmake-build-*/
 CMakeFiles/
 CMakeCache.txt
 compile_commands.json
+external/
 
 # Ninja / Make
 .ninja_*
@@ -29,6 +30,7 @@ data/
 .idea/
 *.swp
 *.swo
+.vs/
 
 # OS junk
 .DS_Store

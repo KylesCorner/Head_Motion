@@ -22,19 +22,43 @@ std::vector<std::uint8_t> stringBytes(const std::string& value) {
 
 } // namespace
 
-MetaWearSdkBridge::MetaWearSdkBridge(headmotion::metawear::MetaWearUsbTransport& usb)
+MetaWearSdkBridge::MetaWearSdkBridge(
+    headmotion::metawear::MetaWearUsbTransport& usb
+)
     : usb_(usb) {
     connection_.context = this;
-    connection_.write_gatt_char = &MetaWearSdkBridge::writeGattCharThunk;
-    connection_.read_gatt_char = &MetaWearSdkBridge::readGattCharThunk;
-    connection_.enable_notifications = &MetaWearSdkBridge::enableNotificationsThunk;
-    connection_.on_disconnect = &MetaWearSdkBridge::onDisconnectThunk;
+    connection_.write_gatt_char =
+        &MetaWearSdkBridge::writeGattCharThunk;
+    connection_.read_gatt_char =
+        &MetaWearSdkBridge::readGattCharThunk;
+    connection_.enable_notifications =
+        &MetaWearSdkBridge::enableNotificationsThunk;
+    connection_.on_disconnect =
+        &MetaWearSdkBridge::onDisconnectThunk;
 
     board_ = mbl_mw_metawearboard_create(&connection_);
 
     if (board_ == nullptr) {
-        throw std::runtime_error("mbl_mw_metawearboard_create returned null");
+        throw std::runtime_error(
+            "mbl_mw_metawearboard_create returned null"
+        );
     }
+
+    /*
+     * The MetaWear SDK defaults to only 150 ms per response.
+     *
+     * That is appropriate for the BLE transport it was designed around,
+     * but is too aggressive for our USB CDC bridge, especially on
+     * Windows where serial-driver scheduling can add latency.
+     *
+     * This value controls the SDK's asynchronous operation timeout;
+     * it does NOT force every operation to wait one second.
+     * Successful responses still complete immediately.
+     */
+    mbl_mw_metawearboard_set_time_for_response(
+        board_,
+        1000
+    );
 }
 
 MetaWearSdkBridge::~MetaWearSdkBridge() {
