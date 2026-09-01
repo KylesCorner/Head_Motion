@@ -416,4 +416,39 @@ std::optional<SavedDevicePort> DevicePortStore::load(
     return port;
 }
 
+std::filesystem::path DevicePortStore::configRoot() {
+#ifdef _WIN32
+    const char* home =
+        std::getenv("USERPROFILE");
+#else
+    const char* home =
+        std::getenv("HOME");
+#endif
+
+    if (home == nullptr || *home == '\0') {
+        throw std::runtime_error(
+            "Unable to determine user home directory"
+        );
+    }
+
+    return std::filesystem::path(home)
+        / ".config"
+        / "headmotion";
+}
+
+std::filesystem::path DevicePortStore::pathForDevice(
+    const std::string& device_id
+) {
+    if (device_id.empty()) {
+        throw std::runtime_error(
+            "Cannot create device port path without a device ID"
+        );
+    }
+
+    return configRoot()
+        / "devices"
+        / device_id
+        / "port.bin";
+}
+
 } // namespace headmotion::session

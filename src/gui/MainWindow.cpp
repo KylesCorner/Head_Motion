@@ -2,6 +2,7 @@
 
 #include "headmotion/app/Commands.hpp"
 #include "headmotion/app/DevicePortResolver.hpp"
+#include "headmotion/session/BoardStateStore.hpp"
 
 #include <FL/Fl.H>
 #include <FL/Fl_Box.H>
@@ -15,9 +16,11 @@
 
 #include <array>
 #include <exception>
+#include <filesystem>
 #include <iomanip>
 #include <optional>
 #include <sstream>
+#include <fstream>
 #include <utility>
 
 namespace headmotion::gui {
@@ -34,14 +37,88 @@ constexpr std::array SAMPLE_RATES = {
     SampleRateOption{50.0f,   "50 Hz"},
     SampleRateOption{100.0f,  "100 Hz"},
     SampleRateOption{200.0f,  "200 Hz"},
-    SampleRateOption{400.0f,  "400 Hz"},
-    SampleRateOption{800.0f,  "800 Hz"},
-    SampleRateOption{1600.0f, "1600 Hz"},
-    SampleRateOption{3200.0f, "3200 Hz"}
+    // SampleRateOption{400.0f,  "400 Hz"},
+    // SampleRateOption{800.0f,  "800 Hz"},
+    // SampleRateOption{1600.0f, "1600 Hz"},
+    // SampleRateOption{3200.0f, "3200 Hz"}
 };
+
 
 constexpr int DEFAULT_SAMPLE_RATE_INDEX = 1;
 constexpr double UI_REFRESH_SECONDS = 0.1;
+
+constexpr const char* DEFAULT_OUTPUT_DIRECTORY =
+    "data/sync";
+
+std::filesystem::path outputDirectoryConfigPath() {
+    return
+        headmotion::session::BoardStateStore::configRoot()
+        / "gui"
+        / "last_download_path.txt";
+}
+
+std::string loadSavedOutputDirectory() {
+    const auto path =
+        outputDirectoryConfigPath();
+
+    std::ifstream in(path);
+
+    if (!in) {
+        return DEFAULT_OUTPUT_DIRECTORY;
+    }
+
+    std::string directory;
+
+    std::getline(
+        in,
+        directory
+    );
+
+    if (directory.empty()) {
+        return DEFAULT_OUTPUT_DIRECTORY;
+    }
+
+    return directory;
+}
+
+void saveOutputDirectory(
+    const std::string& directory
+) {
+    if (directory.empty()) {
+        return;
+    }
+
+    const auto path =
+        outputDirectoryConfigPath();
+
+    if (path.has_parent_path()) {
+        std::filesystem::create_directories(
+            path.parent_path()
+        );
+    }
+
+    std::ofstream out(
+        path,
+        std::ios::out |
+        std::ios::trunc
+    );
+
+    if (!out) {
+        throw std::runtime_error(
+            "Failed to save output directory preference: " +
+            path.string()
+        );
+    }
+
+    out << directory << "\n";
+
+    if (!out) {
+        throw std::runtime_error(
+            "Failed to write output directory preference: " +
+            path.string()
+        );
+    }
+}
 
 } // namespace
 
@@ -70,6 +147,21 @@ MainWindow::MainWindow() {
 }
 
 MainWindow::~MainWindow() {
+    try {
+        if (output_input_ != nullptr) {
+            const std::string output_directory =
+                output_input_->value();
+
+            saveOutputDirectory(
+                output_directory
+            );
+        }
+    } catch (...) {
+        /*
+         * Never allow preference persistence to throw
+         * from the destructor.
+         */
+    }
     Fl::remove_timeout(
         timerCallback,
         this
@@ -199,8 +291,11 @@ void MainWindow::buildUi() {
         30
     );
 
+    const std::string saved_output_directory =
+        loadSavedOutputDirectory();
+
     output_input_->value(
-        "data/sync"
+        saved_output_directory.c_str()
     );
 
     browse_button_ = new Fl_Button(
@@ -426,6 +521,20 @@ void MainWindow::runDownload() {
 
         return;
     }
+    try {
+        saveOutputDirectory(
+            output_directory
+        );
+    } catch (const std::exception& error) {
+        setStatus(
+            std::string(
+                "Could not save output directory preference: "
+            ) +
+            error.what()
+        );
+
+        return;
+    }
 
     resetProgress();
 
@@ -494,13 +603,30 @@ void MainWindow::chooseOutputDirectory() {
         chooser.show();
 
     if (result == 0) {
+        const std::string selected =
+            chooser.filename();
+
         output_input_->value(
-            chooser.filename()
+            selected.c_str()
         );
+
+        try {
+            saveOutputDirectory(
+                selected
+            );
+        } catch (const std::exception& error) {
+            setStatus(
+                std::string(
+                    "Selected output directory, "
+                    "but failed to save preference: "
+                ) +
+                error.what()
+            );
+        }
 
         return;
     }
-
+        
     if (result == -1) {
         setStatus(
             std::string(

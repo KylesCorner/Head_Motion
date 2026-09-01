@@ -17,6 +17,7 @@ std::optional<MmsProbeResult> probeMmsDevice(
 
     try {
         headmotion::transport::SerialConfig config;
+
         config.port_name = port_name;
         config.baud_rate = 115200;
         config.data_bits = 8;
@@ -26,10 +27,14 @@ std::optional<MmsProbeResult> probeMmsDevice(
         config.open_delay = 100ms;
 
         auto port =
-            headmotion::transport::SerialPortFactory::create(config);
+            headmotion::transport::SerialPortFactory::
+                create(config);
 
         port->open();
 
+        /*
+         * MMS identity query.
+         */
         const std::vector<std::uint8_t> query = {
             static_cast<std::uint8_t>('?'),
             static_cast<std::uint8_t>('\n')
@@ -40,23 +45,36 @@ std::optional<MmsProbeResult> probeMmsDevice(
         std::vector<std::uint8_t> response;
 
         const auto deadline =
-            std::chrono::steady_clock::now() + 1500ms;
+            std::chrono::steady_clock::now() +
+            1500ms;
 
-        while (std::chrono::steady_clock::now() < deadline) {
-            auto chunk = port->read(256, 200ms);
+        while (
+            std::chrono::steady_clock::now() <
+            deadline
+        ) {
+            auto chunk =
+                port->read(
+                    256,
+                    200ms
+                );
 
-            response.insert(
-                response.end(),
-                chunk.begin(),
-                chunk.end()
-            );
+            if (!chunk.empty()) {
+                response.insert(
+                    response.end(),
+                    chunk.begin(),
+                    chunk.end()
+                );
+            }
 
             const std::string text(
                 response.begin(),
                 response.end()
             );
 
-            if (text.find('\n') != std::string::npos) {
+            if (
+                text.find('\n') !=
+                std::string::npos
+            ) {
                 break;
             }
         }
@@ -65,15 +83,32 @@ std::optional<MmsProbeResult> probeMmsDevice(
             return std::nullopt;
         }
 
-        const std::string identity(
+        std::string identity(
             response.begin(),
             response.end()
         );
 
+        /*
+         * Strip line endings from the identity response so callers can
+         * safely print/store it without introducing extra lines.
+         */
+        while (
+            !identity.empty() &&
+            (
+                identity.back() == '\n' ||
+                identity.back() == '\r'
+            )
+        ) {
+            identity.pop_back();
+        }
+
         const bool verified =
-            identity.find("MetaMotionS") != std::string::npos ||
-            identity.find("MetaWear") != std::string::npos ||
-            identity.find("MbientLab") != std::string::npos;
+            identity.find("MetaMotionS") !=
+                std::string::npos ||
+            identity.find("MetaWear") !=
+                std::string::npos ||
+            identity.find("MbientLab") !=
+                std::string::npos;
 
         if (!verified) {
             return std::nullopt;
@@ -82,8 +117,14 @@ std::optional<MmsProbeResult> probeMmsDevice(
         return MmsProbeResult{
             .identity = identity
         };
+
     } catch (...) {
-        // Scan should continue when a candidate cannot be opened.
+        /*
+         * Probe failures are intentionally non-fatal.
+         *
+         * scan-ports may have several candidates and should continue
+         * probing the remaining devices if one cannot be opened.
+         */
         return std::nullopt;
     }
 }

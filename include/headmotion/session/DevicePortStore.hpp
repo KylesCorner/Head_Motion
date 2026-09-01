@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <optional>
 #include <string>
+#include <filesystem>
 
 namespace headmotion::session {
 
@@ -19,6 +20,12 @@ struct SavedDevicePort {
 class DevicePortStore {
 public:
     static std::string defaultPath();
+
+    static std::filesystem::path configRoot();
+
+    static std::filesystem::path pathForDevice(
+        const std::string& device_id
+    );
 
     static void save(
         const std::string& path,

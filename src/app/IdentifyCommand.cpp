@@ -1,3 +1,4 @@
+#include "headmotion/session/BoardStateStore.hpp"
 #include "headmotion/transport/SerialConfig.hpp"
 #include "headmotion/transport/SerialPortFactory.hpp"
 
@@ -9,10 +10,33 @@
 
 namespace headmotion::app {
 
-int runIdentifyCommand(const std::string& port_name) {
+int runIdentifyCommand(
+    const std::string& port_name
+) {
     using namespace std::chrono_literals;
 
+    /*
+     * Resolve the physical MMS+ identity.
+     *
+     * This uses the backend USB serial when available, or the
+     * /dev/serial/by-id fallback on Linux.
+     */
+    const std::string device_id =
+        headmotion::session::BoardStateStore::
+            deviceIdForPort(port_name);
+
+    std::cout
+        << "MMS+ device ID: "
+        << device_id
+        << "\n";
+
+    std::cout
+        << "Current port: "
+        << port_name
+        << "\n";
+
     headmotion::transport::SerialConfig config;
+
     config.port_name = port_name;
     config.baud_rate = 115200;
     config.data_bits = 8;
@@ -21,12 +45,19 @@ int runIdentifyCommand(const std::string& port_name) {
     config.assert_rts = true;
     config.open_delay = 100ms;
 
-    auto port = headmotion::transport::SerialPortFactory::create(config);
+    auto port =
+        headmotion::transport::SerialPortFactory::
+            create(config);
 
-    std::cout << "Opening " << port_name << "\n";
+    std::cout
+        << "Opening "
+        << port_name
+        << "\n";
+
     port->open();
 
-    std::cout << "Sending identity query: ?\\n\n";
+    std::cout
+        << "Sending identity query: ?\\n\n";
 
     const std::vector<std::uint8_t> query = {
         static_cast<std::uint8_t>('?'),
@@ -36,32 +67,83 @@ int runIdentifyCommand(const std::string& port_name) {
     port->write(query);
 
     std::vector<std::uint8_t> response;
-    const auto deadline = std::chrono::steady_clock::now() + 1500ms;
 
-    while (std::chrono::steady_clock::now() < deadline) {
-        auto chunk = port->read(256, 200ms);
+    const auto deadline =
+        std::chrono::steady_clock::now() +
+        1500ms;
 
-        if (!chunk.empty()) {
-            response.insert(response.end(), chunk.begin(), chunk.end());
+    while (
+        std::chrono::steady_clock::now() <
+        deadline
+    ) {
+        auto chunk =
+            port->read(
+                256,
+                200ms
+            );
 
-            const std::string text(response.begin(), response.end());
+        if (chunk.empty()) {
+            continue;
+        }
 
-            if (text.find('\n') != std::string::npos ||
-                text.find("MbientLab") != std::string::npos) {
-                break;
-            }
+        response.insert(
+            response.end(),
+            chunk.begin(),
+            chunk.end()
+        );
+
+        const std::string text(
+            response.begin(),
+            response.end()
+        );
+
+        if (
+            text.find('\n') != std::string::npos ||
+            text.find("MbientLab") != std::string::npos
+        ) {
+            break;
         }
     }
 
     if (response.empty()) {
-        std::cout << "No response received.\n";
+        std::cout
+            << "No response received.\n";
+
+        std::cout
+            << "Device ID: "
+            << device_id
+            << "\n";
+
         return 2;
     }
 
-    const std::string text(response.begin(), response.end());
+    std::string text(
+        response.begin(),
+        response.end()
+    );
 
-    std::cout << "Response:\n";
-    std::cout << text << "\n";
+    /*
+     * Remove trailing CR/LF so the identity prints cleanly.
+     */
+    while (
+        !text.empty() &&
+        (
+            text.back() == '\n' ||
+            text.back() == '\r'
+        )
+    ) {
+        text.pop_back();
+    }
+
+    std::cout
+        << "Response: "
+        << text
+        << "\n";
+
+    std::cout
+        << "Device ID: "
+        << device_id
+        << "\n";
 
     return 0;
 }

@@ -235,27 +235,26 @@ bool openCsvForAppend(
     return true;
 }
 
-std::filesystem::path loggerMetadataPath() {
-    return std::filesystem::path(
-        headmotion::session::BoardStateStore::defaultPath() + ".loggers"
-    );
-}
 
-LoggerMetadata loadLoggerMetadata() {
-    const auto path = loggerMetadataPath();
 
+LoggerMetadata loadLoggerMetadata(
+    const std::filesystem::path& path
+) {
     std::ifstream in(path);
 
     if (!in) {
         throw std::runtime_error(
-            "Failed to open logger metadata file: " + path.string() +
-            ". Run record-start again so logger metadata is saved."
+            "Failed to open logger metadata file: " +
+            path.string() +
+            ". Run record-start again for this MMS+ "
+            "so logger metadata is saved."
         );
     }
 
     LoggerMetadata metadata;
 
     std::string line;
+
     while (std::getline(in, line)) {
         const auto pos = line.find('=');
 
@@ -263,46 +262,73 @@ LoggerMetadata loadLoggerMetadata() {
             continue;
         }
 
-        const std::string key = line.substr(0, pos);
-        const std::string value = line.substr(pos + 1);
+        const std::string key =
+            line.substr(0, pos);
+
+        const std::string value =
+            line.substr(pos + 1);
 
         if (key == "metadata_version") {
-            metadata.metadata_version = std::stoi(value);
+            metadata.metadata_version =
+                std::stoi(value);
+
         } else if (key == "recording_start_epoch_ms") {
             metadata.recording_start_epoch_ms =
                 std::stoll(value);
+
         } else if (key == "sample_rate_hz") {
             metadata.sample_rate_hz =
                 static_cast<std::uint32_t>(
                     std::stoul(value)
                 );
+
         } else if (key == "accel_logger_id") {
-            metadata.accel_logger_id = std::stoi(value);
+            metadata.accel_logger_id =
+                std::stoi(value);
+
         } else if (key == "gyro_logger_id") {
-            metadata.gyro_logger_id = std::stoi(value);
+            metadata.gyro_logger_id =
+                std::stoi(value);
+
         } else if (key == "battery_enabled") {
-            metadata.battery_enabled = std::stoi(value) != 0;
+            metadata.battery_enabled =
+                std::stoi(value) != 0;
+
         } else if (key == "battery_logger_id") {
-            metadata.battery_logger_id = std::stoi(value);
+            metadata.battery_logger_id =
+                std::stoi(value);
+
         } else if (key == "battery_timer_id") {
-            metadata.battery_timer_id = std::stoi(value);
+            metadata.battery_timer_id =
+                std::stoi(value);
+
         } else if (key == "battery_interval_seconds") {
             metadata.battery_interval_seconds =
-                static_cast<std::uint32_t>(std::stoul(value));
+                static_cast<std::uint32_t>(
+                    std::stoul(value)
+                );
         }
     }
 
     if (metadata.accel_logger_id < 0) {
-        throw std::runtime_error("Logger metadata missing accel_logger_id");
+        throw std::runtime_error(
+            "Logger metadata missing accel_logger_id"
+        );
     }
 
     if (metadata.gyro_logger_id < 0) {
-        throw std::runtime_error("Logger metadata missing gyro_logger_id");
+        throw std::runtime_error(
+            "Logger metadata missing gyro_logger_id"
+        );
     }
 
-    if (metadata.battery_enabled && metadata.battery_logger_id < 0) {
+    if (
+        metadata.battery_enabled &&
+        metadata.battery_logger_id < 0
+    ) {
         throw std::runtime_error(
-            "Logger metadata says battery is enabled, but battery_logger_id is missing"
+            "Logger metadata says battery is enabled, "
+            "but battery_logger_id is missing"
         );
     }
 
@@ -1023,6 +1049,41 @@ int runSyncCommand(
 ) {
     using namespace std::chrono_literals;
 
+
+    /*
+     * Resolve persistent host-side state from the physical MMS+.
+     *
+     * The USB serial number is the persistent identity. The operating
+     * system's /dev/ttyACM* or COM* number is only the current transport.
+     */
+    const std::string device_id =
+        headmotion::session::BoardStateStore::
+            deviceIdForPort(port_name);
+
+    const std::filesystem::path state_path =
+        headmotion::session::BoardStateStore::
+            boardStatePath(device_id);
+
+    const std::filesystem::path metadata_path =
+        headmotion::session::BoardStateStore::
+            loggerMetadataPath(device_id);
+
+    std::cout
+        << "MMS+ device ID: "
+        << device_id
+        << "\n";
+
+    std::cout
+        << "Board state: "
+        << state_path
+        << "\n";
+
+    std::cout
+        << "Logger metadata: "
+        << metadata_path
+        << "\n";
+
+
     /*
      * These must outlive MetaWearSdkBridge/MetaWearUsbTransport because the SDK
      * can hold callback context pointers into them.
@@ -1057,24 +1118,54 @@ int runSyncCommand(
         return 2;
     }
 
-    const auto state_path = headmotion::session::BoardStateStore::defaultPath();
+    if (!std::filesystem::exists(state_path)) {
+        throw std::runtime_error(
+            "No saved board state exists for MMS+ " +
+            device_id +
+            ": " +
+            state_path.string() +
+            ". Run record-start on this sensor first."
+        );
+    }
 
-    std::cout << "Loading board state: " << state_path << "\n";
+    std::cout
+        << "Loading board state for "
+        << device_id
+        << ": "
+        << state_path
+        << "\n";
+
     const auto board_state =
-        headmotion::session::BoardStateStore::load(state_path);
+        headmotion::session::BoardStateStore::load(
+            state_path
+        );
 
-    std::cout << "Deserializing board state ["
-              << board_state.size()
-              << " bytes]\n";
+    std::cout
+        << "Deserializing board state ["
+        << board_state.size()
+        << " bytes]\n";
 
-    bridge.deserializeBoard(board_state);
-    pumpFor(bridge, 250);
+    bridge.deserializeBoard(
+        board_state
+    );
 
-    std::cout << "Loading logger metadata: "
-              << loggerMetadataPath()
-              << "\n";
+    pumpFor(
+        bridge,
+        250
+    );
 
-    const LoggerMetadata metadata = loadLoggerMetadata();
+
+    std::cout
+        << "Loading logger metadata for "
+        << device_id
+        << ": "
+        << metadata_path
+        << "\n";
+
+    const LoggerMetadata metadata =
+        loadLoggerMetadata(
+            metadata_path
+        );
 
     sync_state.recording_start_epoch_ms =
     metadata.recording_start_epoch_ms;
@@ -1513,7 +1604,13 @@ int runSyncCommand(
         pumpFor(bridge, 2000);
     }
 
-    std::cout << "Sync complete.\n";
+    std::cout
+        << "Sync complete.\n";
+
+    std::cout
+        << "Device ID: "
+        << device_id
+        << "\n";
     std::cout << "IMU rows written: "
               << sync_state.imu_rows_written.load()
               << "\n";

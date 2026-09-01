@@ -76,11 +76,6 @@ struct EventRecordState {
     std::atomic<bool> failed{false};
 };
 
-std::filesystem::path loggerMetadataPath() {
-    return std::filesystem::path(
-        headmotion::session::BoardStateStore::defaultPath() + ".loggers"
-    );
-}
 
 std::int64_t currentEpochMs() {
     return std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -193,6 +188,7 @@ void printCoreModuleInfo(MblMwMetaWearBoard* board) {
 // }
 
 void saveLoggerMetadata(
+    const std::filesystem::path& path,
     std::uint8_t accel_logger_id,
     std::uint8_t gyro_logger_id,
     bool battery_enabled,
@@ -208,7 +204,6 @@ void saveLoggerMetadata(
         );
     }
 
-    const auto path = loggerMetadataPath();
 
     if (path.has_parent_path()) {
         std::filesystem::create_directories(
@@ -323,19 +318,26 @@ MblMwGyroBoschOdr gyroOdrFromRate(float sample_rate_hz) {
     );
 }
 
-void removeStaleBoardState() {
-    const auto state_path = headmotion::session::BoardStateStore::defaultPath();
-
+void removeStaleBoardState(
+    const std::filesystem::path& state_path,
+    const std::filesystem::path& metadata_path
+) {
     if (std::filesystem::exists(state_path)) {
         std::filesystem::remove(state_path);
-        std::cout << "Removed stale board state: " << state_path << "\n";
-    }
 
-    const auto metadata_path = loggerMetadataPath();
+        std::cout
+            << "Removed stale board state: "
+            << state_path
+            << "\n";
+    }
 
     if (std::filesystem::exists(metadata_path)) {
         std::filesystem::remove(metadata_path);
-        std::cout << "Removed stale logger metadata: " << metadata_path << "\n";
+
+        std::cout
+            << "Removed stale logger metadata: "
+            << metadata_path
+            << "\n";
     }
 }
 
@@ -687,7 +689,47 @@ int runRecordStartCommand(
 
     const bool battery_enabled = battery_interval_seconds > 0;
 
-    removeStaleBoardState();
+    /*
+    * Resolve persistent host-side state from the physical sensor identity,
+    * not from /dev/ttyACM* or COM*.
+    */
+    const std::string device_id =
+        headmotion::session::BoardStateStore::deviceIdForPort(
+            port_name
+        );
+
+    const std::filesystem::path state_path =
+        headmotion::session::BoardStateStore::boardStatePath(
+            device_id
+        );
+
+    const std::filesystem::path metadata_path =
+        headmotion::session::BoardStateStore::loggerMetadataPath(
+            device_id
+        );
+
+    std::cout
+        << "MMS+ device ID: "
+        << device_id
+        << "\n";
+
+    std::cout
+        << "Board state: "
+        << state_path
+        << "\n";
+
+    std::cout
+        << "Logger metadata: "
+        << metadata_path
+        << "\n";
+
+    /*
+    * Only remove stale host-side state belonging to this physical sensor.
+    */
+    removeStaleBoardState(
+        state_path,
+        metadata_path
+    );
 
     headmotion::transport::SerialConfig config;
     config.port_name = port_name;
@@ -962,6 +1004,7 @@ int runRecordStartCommand(
     //     battery_interval_seconds
     // );
     saveLoggerMetadata(
+    metadata_path,
     accel_logger_id,
     gyro_logger_id,
     battery_enabled,
@@ -973,13 +1016,17 @@ int runRecordStartCommand(
     );
 
     std::cout << "Saved logger metadata: "
-              << loggerMetadataPath()
+              << metadata_path 
               << "\n";
 
-    const auto board_state = bridge.serializeBoard();
-    const auto state_path = headmotion::session::BoardStateStore::defaultPath();
 
-    headmotion::session::BoardStateStore::save(state_path, board_state);
+    const auto board_state =
+        bridge.serializeBoard();
+
+    headmotion::session::BoardStateStore::save(
+        state_path,
+        board_state
+    );
 
     std::cout << "Saved board state: "
               << state_path

@@ -1,4 +1,5 @@
 #include "headmotion/metawear/MetaWearUsbTransport.hpp"
+#include "headmotion/session/BoardStateStore.hpp"
 #include "headmotion/transport/SerialConfig.hpp"
 #include "headmotion/transport/SerialPortFactory.hpp"
 #include "headmotion/util/Hex.hpp"
@@ -11,10 +12,33 @@
 
 namespace headmotion::app {
 
-int runModuleInfoCommand(const std::string& port_name) {
+int runModuleInfoCommand(
+    const std::string& port_name
+) {
     using namespace std::chrono_literals;
 
+    /*
+     * Resolve the physical MMS+ identity from the current serial port.
+     *
+     * This uses the USB serial number when available and the Linux
+     * /dev/serial/by-id fallback otherwise.
+     */
+    const std::string device_id =
+        headmotion::session::BoardStateStore::
+            deviceIdForPort(port_name);
+
+    std::cout
+        << "MMS+ device ID: "
+        << device_id
+        << "\n";
+
+    std::cout
+        << "Current port: "
+        << port_name
+        << "\n";
+
     headmotion::transport::SerialConfig config;
+
     config.port_name = port_name;
     config.baud_rate = 115200;
     config.data_bits = 8;
@@ -23,10 +47,19 @@ int runModuleInfoCommand(const std::string& port_name) {
     config.assert_rts = true;
     config.open_delay = 100ms;
 
-    auto serial = headmotion::transport::SerialPortFactory::create(config);
-    headmotion::metawear::MetaWearUsbTransport usb(*serial);
+    auto serial =
+        headmotion::transport::SerialPortFactory::
+            create(config);
 
-    std::cout << "Opening " << port_name << "\n";
+    headmotion::metawear::MetaWearUsbTransport usb(
+        *serial
+    );
+
+    std::cout
+        << "Opening "
+        << port_name
+        << "\n";
+
     usb.open();
 
     const std::vector<std::uint8_t> module_info_payload = {
@@ -34,30 +67,54 @@ int runModuleInfoCommand(const std::string& port_name) {
         0x80
     };
 
-    std::cout << "Sending module-info payload: "
-              << headmotion::util::hexDump(module_info_payload)
-              << "\n";
+    std::cout
+        << "Sending module-info payload: "
+        << headmotion::util::hexDump(
+            module_info_payload
+        )
+        << "\n";
 
-    const auto response = usb.transactPayload(module_info_payload, 1500ms);
+    const auto response =
+        usb.transactPayload(
+            module_info_payload,
+            1500ms
+        );
 
     if (response.empty()) {
-        std::cout << "No module-info response received.\n";
+        std::cout
+            << "No module-info response received.\n";
+
+        std::cout
+            << "Device ID: "
+            << device_id
+            << "\n";
+
         return 2;
     }
 
-    std::cout << "Module-info response payload ["
-              << response.size()
-              << " bytes]: "
-              << headmotion::util::hexDump(response)
-              << "\n";
+    std::cout
+        << "Module-info response payload ["
+        << response.size()
+        << " bytes]: "
+        << headmotion::util::hexDump(response)
+        << "\n";
 
-    if (response.size() >= 4 &&
+    if (
+        response.size() >= 4 &&
         response[0] == 0x01 &&
-        response[1] == 0x80) {
-        std::cout << "Module-info round trip OK.\n";
+        response[1] == 0x80
+    ) {
+        std::cout
+            << "Module-info round trip OK.\n";
     } else {
-        std::cout << "Unexpected module-info response shape.\n";
+        std::cout
+            << "Unexpected module-info response shape.\n";
     }
+
+    std::cout
+        << "Device ID: "
+        << device_id
+        << "\n";
 
     return 0;
 }

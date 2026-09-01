@@ -34,11 +34,6 @@ struct StopMetadata {
     int battery_timer_id = -1;
 };
 
-std::filesystem::path loggerMetadataPath() {
-    return std::filesystem::path(
-        headmotion::session::BoardStateStore::defaultPath() + ".loggers"
-    );
-}
 
 void pumpFor(headmotion::sdk::MetaWearSdkBridge& bridge, int total_ms) {
     const auto deadline =
@@ -50,8 +45,7 @@ void pumpFor(headmotion::sdk::MetaWearSdkBridge& bridge, int total_ms) {
     }
 }
 
-bool loadStopMetadata(StopMetadata& metadata) {
-    const auto path = loggerMetadataPath();
+bool loadStopMetadata(const std::filesystem::path& path, StopMetadata& metadata) {
     std::ifstream in(path);
 
     if (!in) {
@@ -86,30 +80,54 @@ bool loadStopMetadata(StopMetadata& metadata) {
     return true;
 }
 
-bool restoreBoardStateIfAvailable(headmotion::sdk::MetaWearSdkBridge& bridge) {
-    const auto state_path = headmotion::session::BoardStateStore::defaultPath();
-
+bool restoreBoardStateIfAvailable(
+    headmotion::sdk::MetaWearSdkBridge& bridge,
+    const std::filesystem::path& state_path
+) {
     if (!std::filesystem::exists(state_path)) {
-        std::cout << "Saved board state not found: " << state_path << "\n";
-        std::cout << "Timer lookup may not be available.\n";
+        std::cout
+            << "Saved board state not found: "
+            << state_path
+            << "\n";
+
+        std::cout
+            << "Timer lookup may not be available.\n";
+
         return false;
     }
 
     try {
-        std::cout << "Loading board state: " << state_path << "\n";
+        std::cout
+            << "Loading board state: "
+            << state_path
+            << "\n";
+
         const auto board_state =
-            headmotion::session::BoardStateStore::load(state_path);
+            headmotion::session::BoardStateStore::load(
+                state_path
+            );
 
-        std::cout << "Deserializing board state ["
-                  << board_state.size()
-                  << " bytes]\n";
+        std::cout
+            << "Deserializing board state ["
+            << board_state.size()
+            << " bytes]\n";
 
-        bridge.deserializeBoard(board_state);
+        bridge.deserializeBoard(
+            board_state
+        );
+
         pumpFor(bridge, 250);
+
         return true;
     } catch (const std::exception& ex) {
-        std::cout << "Failed to restore board state: " << ex.what() << "\n";
-        std::cout << "Continuing with best-effort stop.\n";
+        std::cout
+            << "Failed to restore board state: "
+            << ex.what()
+            << "\n";
+
+        std::cout
+            << "Continuing with best-effort stop.\n";
+
         return false;
     }
 }
@@ -207,6 +225,34 @@ int runRecordStopCommand(const std::string& port_name) {
     config.assert_rts = true;
     config.open_delay = 100ms;
 
+    const std::string device_id =
+        headmotion::session::BoardStateStore::
+            deviceIdForPort(port_name);
+
+    const std::filesystem::path state_path =
+        headmotion::session::BoardStateStore::
+            boardStatePath(device_id);
+
+    const std::filesystem::path metadata_path =
+        headmotion::session::BoardStateStore::
+            loggerMetadataPath(device_id);
+
+    std::cout
+        << "MMS+ device ID: "
+        << device_id
+        << "\n";
+
+    std::cout
+        << "Board state: "
+        << state_path
+        << "\n";
+
+    std::cout
+        << "Logger metadata: "
+        << metadata_path
+        << "\n";
+
+
     auto serial = headmotion::transport::SerialPortFactory::create(config);
     headmotion::metawear::MetaWearUsbTransport usb(*serial);
 
@@ -230,9 +276,9 @@ int runRecordStopCommand(const std::string& port_name) {
     pumpFor(bridge, 250);
 
     StopMetadata metadata;
-    loadStopMetadata(metadata);
+    loadStopMetadata(metadata_path, metadata);
 
-    restoreBoardStateIfAvailable(bridge);
+    restoreBoardStateIfAvailable(bridge, state_path);
     board = bridge.board();
 
     stopBatteryTimerIfKnown(bridge, board, metadata);
