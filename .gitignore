@@ -18,6 +18,10 @@ Makefile.user
 *.so
 *.dylib
 *.dll
+
+# RAG database
+.rag_index.db
+.rag_indexed
 *.exe
 
 # Logs / data

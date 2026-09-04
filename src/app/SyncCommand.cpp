@@ -65,6 +65,7 @@ struct LoggerMetadata {
     int metadata_version = 1;
 
     std::int64_t recording_start_epoch_ms = -1;
+    std::int64_t recording_start_system_time = -1;
     std::uint32_t sample_rate_hz = 0;
 
     int accel_logger_id = -1;
@@ -118,6 +119,7 @@ struct SyncState {
      * downloading a recording created by an older program version.
      */
     std::int64_t recording_start_epoch_ms = -1;
+    std::int64_t recording_start_system_time = -1;
     std::optional<std::int64_t> first_sdk_epoch_ms;
     bool timestamp_warning_printed = false;
 
@@ -276,6 +278,10 @@ LoggerMetadata loadLoggerMetadata(
             metadata.recording_start_epoch_ms =
                 std::stoll(value);
 
+        } else if (key == "recording_start_system_time") {
+            metadata.recording_start_system_time =
+                std::stoll(value);
+
         } else if (key == "sample_rate_hz") {
             metadata.sample_rate_hz =
                 static_cast<std::uint32_t>(
@@ -399,6 +405,7 @@ void printUnexpectedData(
 struct RowTimestamp {
     std::int64_t epoch_ms = 0;
     std::int64_t elapsed_ms = 0;
+    std::string utc_timestamp = "";
 };
 
 RowTimestamp resolveRowTimestampLocked(
@@ -425,6 +432,19 @@ RowTimestamp resolveRowTimestampLocked(
             sdk_epoch_ms -
             *state.first_sdk_epoch_ms;
     }
+
+    // Generate human-readable UTC timestamp in YYYY-MM-DD HH:MM:SS.mmm format
+    auto time_point = std::chrono::system_clock::from_time_t(0) + 
+                      std::chrono::milliseconds(timestamp.epoch_ms);
+    auto time_t = std::chrono::system_clock::to_time_t(time_point);
+    auto ms = timestamp.epoch_ms % 1000;
+    
+    // Format as YYYY-MM-DD HH:MM:SS.mmm
+    std::tm* tm_info = std::gmtime(&time_t);
+    char buffer[32];
+    std::strftime(buffer, sizeof(buffer), "%Y-%m-%d %H:%M:%S", tm_info);
+    timestamp.utc_timestamp = std::string(buffer) + "." + 
+                              std::to_string(ms);
 
     if (timestamp.elapsed_ms < 0 &&
         !state.timestamp_warning_printed) {
@@ -522,6 +542,8 @@ void writeImuDataRow(
         << timestamp.epoch_ms
         << ","
         << timestamp.elapsed_ms
+        << ","
+        << timestamp.utc_timestamp
         << ","
         << sensor
         << ","
@@ -631,6 +653,8 @@ bool writeXsensWideRow(
         << gyro.z
         << ","
         << timestamp.elapsed_ms
+        << ","
+        << timestamp.utc_timestamp
         << "\n";
 
     if (!state.xsens_csv) {
@@ -818,6 +842,8 @@ void writeBatteryDataRow(
         << timestamp.epoch_ms
         << ","
         << timestamp.elapsed_ms
+        << ","
+        << timestamp.utc_timestamp
         << ","
         << battery->voltage
         << ","
@@ -1274,7 +1300,7 @@ int runSyncCommand(
     if (!openCsvForAppend(
         sync_state.imu_csv,
         imu_path,
-        "epoch_ms,elapsed_ms,sensor,x,y,z\n"
+        "epoch_ms,elapsed_ms,utc_timestamp,sensor,x,y,z\n"
     )) {
         return 3;
     }
@@ -1285,7 +1311,7 @@ int runSyncCommand(
             sync_state.xsens_csv,
             xsens_path,
             "PacketCounter,SampleTimeFine,Euler_X,Euler_Y,Euler_Z,"
-            "Acc_X,Acc_Y,Acc_Z,Gyr_X,Gyr_Y,Gyr_Z,elapsed_ms\n"
+            "Acc_X,Acc_Y,Acc_Z,Gyr_X,Gyr_Y,Gyr_Z,elapsed_ms,utc_timestamp\n"
         )) {
         sync_state.imu_csv.close();
         return 3;
@@ -1314,7 +1340,7 @@ int runSyncCommand(
         if (!openCsvForAppend(
                 sync_state.battery_csv,
                 battery_path,
-                "epoch_ms,elapsed_ms,voltage_mv,charge_percent\n"
+                "epoch_ms,elapsed_ms,utc_timestamp,voltage_mv,charge_percent\n"
             )) {
             sync_state.imu_csv.close();
             sync_state.xsens_csv.close();

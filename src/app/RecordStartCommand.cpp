@@ -28,6 +28,8 @@ extern "C" {
 #include "metawear/core/settings.h"
 #include "metawear/core/timer.h"
 #include "metawear/core/types.h"
+
+#include <chrono>
 #include "metawear/sensor/accelerometer.h"
 #include "metawear/sensor/gyro_bosch.h"
 }
@@ -196,6 +198,7 @@ void saveLoggerMetadata(
     std::uint8_t battery_timer_id,
     std::uint32_t battery_interval_seconds,
     std::int64_t recording_start_epoch_ms,
+    const std::chrono::system_clock::time_point& recording_start_system_time,
     std::uint32_t sample_rate_hz
 ) {
     if (recording_start_epoch_ms <= 0) {
@@ -228,6 +231,11 @@ void saveLoggerMetadata(
         << "metadata_version=2\n"
         << "recording_start_epoch_ms="
         << recording_start_epoch_ms
+        << "\n"
+        << "recording_start_system_time="
+        << std::chrono::duration_cast<std::chrono::milliseconds>(
+            recording_start_system_time.time_since_epoch()
+        ).count()
         << "\n"
         << "sample_rate_hz="
         << sample_rate_hz
@@ -970,6 +978,10 @@ int runRecordStartCommand(
     */
     const std::int64_t recording_start_epoch_ms =
         currentEpochMs();
+    
+    // Also capture the actual system time when recording started for alignment
+    const auto recording_start_system_time = 
+        std::chrono::system_clock::now();
 
     std::cout
         << "Recording start epoch: "
@@ -1012,6 +1024,7 @@ int runRecordStartCommand(
     battery_timer_id,
     battery_interval_seconds,
     recording_start_epoch_ms,
+    recording_start_system_time,
     static_cast<std::uint32_t>(sample_rate_hz)
     );
 
