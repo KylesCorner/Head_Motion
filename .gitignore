@@ -5,9 +5,6 @@ cmake-build-*/
 CMakeFiles/
 CMakeCache.txt
 compile_commands.json
-external/
-
-# Ninja / Make
 .ninja_*
 *.ninja
 Makefile.user
@@ -18,11 +15,11 @@ Makefile.user
 *.so
 *.dylib
 *.dll
+*.exe
 
 # RAG database
 .rag_index.db
 .rag_indexed
-*.exe
 
 # Logs / data
 *.log
@@ -39,3 +36,62 @@ data/
 # OS junk
 .DS_Store
 Thumbs.db
+
+# Python cache
+__pycache__/
+*.pyc
+.pytest_cache/
+.coverage
+
+# Valgrind logs
+valgrind-sync.*.log
+
+# IDE specific
+*.swp
+*.swo
+*~
+
+# Temporary files
+*.tmp
+*.temp
+
+# Environment files
+.env
+.env.local
+.env.*.local
+
+# Package manager files
+node_modules/
+npm-debug.log
+yarn-debug.log
+yarn-error.log
+
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+desktop.ini
+
+# CMake build artifacts (more specific)
+build/*/CMakeFiles/
+build/*/CMakeCache.txt
+build/*/cmake_install.cmake
+build/*/CPackConfig.cmake
+build/*/CPackSourceConfig.cmake
+build/*/build.ninja
+build/*/compile_commands.json
+build/*/ninja.log
+build/*/ninja_deps
+
+# Platform-specific build artifacts
+*.so.*
+*.dylib.*
+*.dll.*
+
+# Generated documentation
+docs/_build/
+external/
