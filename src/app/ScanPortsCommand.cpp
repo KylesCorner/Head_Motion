@@ -191,14 +191,10 @@ int runScanPortsCommand() {
         << device_id
         << "\n";
 
-        std::cout
-            << " - verified: "
-            << probe->identity
-            << "\n";
-
         verified_devices.push_back({
             .port = port,
-            .identity = probe->identity
+            .identity = probe->identity,
+            .device_id = device_id
         });
     }
 
@@ -238,7 +234,7 @@ int runScanPortsCommand() {
             port.product_id;
 
         saved.serial_number =
-            port.serial_number;
+            device.device_id;
 
         const auto store_path =
             headmotion::session::DevicePortStore::
