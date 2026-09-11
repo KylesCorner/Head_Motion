@@ -1,138 +1,341 @@
 #include "headmotion/app/Commands.hpp"
 #include "headmotion/app/DevicePortResolver.hpp"
 
+#include <algorithm>
 #include <cstdint>
 #include <exception>
 #include <iostream>
 #include <optional>
+#include <sstream>
 #include <stdexcept>
+#include <streambuf>
 #include <string>
 
 namespace {
 
-struct RecordStartArguments {
+enum class CliExitCode : int {
+    success = 0,
+    usage = 2,
+    no_device = 3,
+    ambiguous_device = 4,
+    device_id_not_found = 5,
+    selector_conflict = 6,
+    backend_failure = 20,
+    unexpected_failure = 21
+};
+
+struct CommonArguments {
     std::optional<std::string> port;
+    std::optional<std::string> device_id;
+    bool json = false;
+    bool quiet = false;
+};
+
+struct RecordStartArguments {
+    CommonArguments common;
     float sample_rate_hz = 50.0f;
     std::uint32_t battery_interval_seconds = 0;
 };
 
 struct SyncArguments {
-    std::optional<std::string> port;
+    CommonArguments common;
     std::string output_path = "data/sync";
 };
 
 struct PortAndPayloadArguments {
-    std::optional<std::string> port;
+    CommonArguments common;
     std::string payload;
 };
+
+class NullBuffer final : public std::streambuf {
+protected:
+    int overflow(int ch) override {
+        return ch;
+    }
+};
+
+class ScopedCommandOutput {
+public:
+    explicit ScopedCommandOutput(bool suppress)
+        : suppress_(suppress) {
+        if (!suppress_) {
+            return;
+        }
+
+        old_cout_ = std::cout.rdbuf(&null_buffer_);
+        old_cerr_ = std::cerr.rdbuf(&null_buffer_);
+    }
+
+    ~ScopedCommandOutput() {
+        if (!suppress_) {
+            return;
+        }
+
+        std::cout.rdbuf(old_cout_);
+        std::cerr.rdbuf(old_cerr_);
+    }
+
+    ScopedCommandOutput(const ScopedCommandOutput&) = delete;
+    ScopedCommandOutput& operator=(const ScopedCommandOutput&) = delete;
+
+private:
+    bool suppress_ = false;
+    NullBuffer null_buffer_;
+    std::streambuf* old_cout_ = nullptr;
+    std::streambuf* old_cerr_ = nullptr;
+};
+
+std::string jsonEscape(const std::string& value) {
+    std::ostringstream out;
+
+    for (const char ch : value) {
+        switch (ch) {
+            case '\\': out << "\\\\"; break;
+            case '"': out << "\\\""; break;
+            case '\b': out << "\\b"; break;
+            case '\f': out << "\\f"; break;
+            case '\n': out << "\\n"; break;
+            case '\r': out << "\\r"; break;
+            case '\t': out << "\\t"; break;
+            default:
+                if (static_cast<unsigned char>(ch) < 0x20) {
+                    out << "?";
+                } else {
+                    out << ch;
+                }
+                break;
+        }
+    }
+
+    return out.str();
+}
+
+void emitJson(
+    const std::string& json_line,
+    std::streambuf* output_buffer
+) {
+    std::ostream out(output_buffer);
+    out << json_line << '\n';
+    out.flush();
+}
+
+void emitStarted(
+    const std::string& command,
+    const std::optional<std::string>& port,
+    const std::optional<std::string>& device_id,
+    std::streambuf* output_buffer
+) {
+    std::ostringstream line;
+    line
+        << "{\"event\":\"started\",\"command\":\""
+        << jsonEscape(command)
+        << "\"";
+
+    if (port.has_value()) {
+        line
+            << ",\"port\":\""
+            << jsonEscape(*port)
+            << "\"";
+    }
+
+    if (device_id.has_value()) {
+        line
+            << ",\"device_id\":\""
+            << jsonEscape(*device_id)
+            << "\"";
+    }
+
+    line << "}";
+    emitJson(line.str(), output_buffer);
+}
+
+void emitCompleted(
+    const std::string& command,
+    int backend_exit_code,
+    int process_exit_code,
+    std::streambuf* output_buffer
+) {
+    std::ostringstream line;
+    line
+        << "{\"event\":\"completed\",\"command\":\""
+        << jsonEscape(command)
+        << "\",\"backend_exit_code\":"
+        << backend_exit_code
+        << ",\"exit_code\":"
+        << process_exit_code
+        << "}";
+
+    emitJson(line.str(), output_buffer);
+}
+
+void emitError(
+    const std::string& command,
+    const std::string& code,
+    const std::string& message,
+    int process_exit_code,
+    std::streambuf* output_buffer
+) {
+    std::ostringstream line;
+    line
+        << "{\"event\":\"error\",\"command\":\""
+        << jsonEscape(command)
+        << "\",\"code\":\""
+        << jsonEscape(code)
+        << "\",\"message\":\""
+        << jsonEscape(message)
+        << "\",\"exit_code\":"
+        << process_exit_code
+        << "}";
+
+    emitJson(line.str(), output_buffer);
+}
+
+bool rawFlagPresent(
+    int argc,
+    char** argv,
+    const std::string& flag
+) {
+    for (int i = 2; i < argc; ++i) {
+        if (argv[i] == flag) {
+            return true;
+        }
+    }
+
+    return false;
+}
 
 void printUsage(const char* argv0) {
     std::cerr
         << "Usage:\n"
-        << "  " << argv0 << " scan\n"
-        << "  " << argv0 << " identify [--port <serial-port>]\n"
-        << "  " << argv0
-        << " tx-raw [--port <serial-port>] <hex-bytes>\n"
-        << "  " << argv0
-        << " cmd [--port <serial-port>] <payload-hex>\n"
-        << "  " << argv0 << " module-info [--port <serial-port>]\n"
-        << "  " << argv0 << " sdk-probe [--port <serial-port>]\n"
-        << "  " << argv0
-        << " record-start [--port <serial-port>]"
-        << " [--rate <hz>]"
-        << " [--battery-interval <seconds>]\n"
-        << "  " << argv0 << " record-stop [--port <serial-port>]\n"
-        << "  " << argv0
-        << " sync [--port <serial-port>] [--out <directory>]\n"
-        << "  " << argv0 << " record-reset [--port <serial-port>]\n"
+        << "  " << argv0 << " scan [--json] [--quiet]\n"
+        << "  " << argv0 << " identify [device selector] [output options]\n"
+        << "  " << argv0 << " module-info [device selector] [output options]\n"
+        << "  " << argv0 << " sdk-probe [device selector] [output options]\n"
+        << "  " << argv0 << " record-start [device selector] [--rate <hz>]"
+        << " [--battery-interval <seconds>] [output options]\n"
+        << "  " << argv0 << " record-stop [device selector] [output options]\n"
+        << "  " << argv0 << " sync [device selector]"
+        << " [--out <directory> | --output-dir <directory>] [output options]\n"
+        << "  " << argv0 << " record-reset [device selector] [output options]\n"
         << "\n"
-        << "Run `"
-        << argv0
-        << " scan` to discover and save the default MMS+ port.\n"
-        << "Omit --port to use the saved default port.\n"
+        << "Device selector (choose at most one):\n"
+        << "  --port <serial-port>\n"
+        << "  --device-id <stable-usb-serial>\n"
         << "\n"
-        << "Examples:\n"
-        << "  " << argv0 << " scan\n"
-        << "  " << argv0 << " identify\n"
-        << "  " << argv0 << " record-reset\n"
-        << "  " << argv0 << " record-start --rate 50\n"
-        << "  " << argv0 << " record-stop\n"
-        << "  " << argv0 << " sync --out data/session_001\n"
-        << "  " << argv0
-        << " identify --port /dev/ttyACM0\n";
+        << "Output options:\n"
+        << "  --json   emit newline-delimited JSON and suppress command chatter\n"
+        << "  --quiet  suppress normal command output\n"
+        << "\n"
+        << "Exit codes:\n"
+        << "  0   success\n"
+        << "  2   invalid arguments\n"
+        << "  3   no MMS+ available\n"
+        << "  4   multiple MMS+ devices; selector required\n"
+        << "  5   requested device-id not found\n"
+        << "  6   conflicting/invalid device selector\n"
+        << "  20  backend command failed\n"
+        << "  21  unexpected failure\n";
 }
 
-void setPort(
-    std::optional<std::string>& port,
-    const char* value
+void setOptionalValue(
+    std::optional<std::string>& destination,
+    const char* value,
+    const std::string& option_name
 ) {
-    if (port.has_value()) {
+    if (destination.has_value()) {
         throw std::runtime_error(
-            "--port was specified more than once"
+            option_name + " was specified more than once"
         );
     }
 
     if (value == nullptr || std::string(value).empty()) {
         throw std::runtime_error(
-            "--port requires a non-empty serial-port value"
+            option_name + " requires a non-empty value"
         );
     }
 
-    port = value;
+    destination = value;
 }
 
-bool consumePortOption(
+bool consumeCommonOption(
     int argc,
     char** argv,
     int& index,
-    std::optional<std::string>& port
+    CommonArguments& common,
+    bool allow_device_selector = true
 ) {
     const std::string option = argv[index];
 
-    if (option != "--port") {
+    if (option == "--json") {
+        common.json = true;
+        ++index;
+        return true;
+    }
+
+    if (option == "--quiet") {
+        common.quiet = true;
+        ++index;
+        return true;
+    }
+
+    if (!allow_device_selector) {
         return false;
     }
 
-    if (index + 1 >= argc) {
-        throw std::runtime_error(
-            "--port requires a serial-port value"
-        );
+    if (option == "--port" || option == "--device-id") {
+        if (index + 1 >= argc) {
+            throw std::runtime_error(
+                option + " requires a value"
+            );
+        }
+
+        if (option == "--port") {
+            setOptionalValue(
+                common.port,
+                argv[index + 1],
+                option
+            );
+        } else {
+            setOptionalValue(
+                common.device_id,
+                argv[index + 1],
+                option
+            );
+        }
+
+        index += 2;
+        return true;
     }
 
-    setPort(port, argv[index + 1]);
-    index += 2;
-
-    return true;
+    return false;
 }
 
-std::optional<std::string> parsePortOnlyArguments(
+CommonArguments parseCommonOnlyArguments(
     int argc,
     char** argv,
-    const std::string& command
+    const std::string& command,
+    bool allow_device_selector = true
 ) {
-    std::optional<std::string> port;
-
+    CommonArguments common;
     int index = 2;
 
     while (index < argc) {
-        if (consumePortOption(
+        if (consumeCommonOption(
                 argc,
                 argv,
                 index,
-                port
+                common,
+                allow_device_selector
             )) {
             continue;
         }
 
         throw std::runtime_error(
-            "Unknown option for " +
-            command +
-            ": " +
-            argv[index]
+            "Unknown option for " + command + ": " + argv[index]
         );
     }
 
-    return port;
+    return common;
 }
 
 PortAndPayloadArguments parsePortAndPayloadArguments(
@@ -142,15 +345,14 @@ PortAndPayloadArguments parsePortAndPayloadArguments(
     const std::string& payload_name
 ) {
     PortAndPayloadArguments arguments;
-
     int index = 2;
 
     while (index < argc) {
-        if (consumePortOption(
+        if (consumeCommonOption(
                 argc,
                 argv,
                 index,
-                arguments.port
+                arguments.common
             )) {
             continue;
         }
@@ -159,18 +361,13 @@ PortAndPayloadArguments parsePortAndPayloadArguments(
 
         if (!argument.empty() && argument.front() == '-') {
             throw std::runtime_error(
-                "Unknown option for " +
-                command +
-                ": " +
-                argument
+                "Unknown option for " + command + ": " + argument
             );
         }
 
         if (!arguments.payload.empty()) {
             throw std::runtime_error(
-                command +
-                " accepts exactly one " +
-                payload_name
+                command + " accepts exactly one " + payload_name
             );
         }
 
@@ -180,9 +377,7 @@ PortAndPayloadArguments parsePortAndPayloadArguments(
 
     if (arguments.payload.empty()) {
         throw std::runtime_error(
-            command +
-            " requires " +
-            payload_name
+            command + " requires " + payload_name
         );
     }
 
@@ -194,26 +389,19 @@ float parseFloat(
     const std::string& option_name
 ) {
     std::size_t consumed = 0;
-
     float value = 0.0f;
 
     try {
         value = std::stof(text, &consumed);
     } catch (const std::exception&) {
         throw std::runtime_error(
-            "Invalid value for " +
-            option_name +
-            ": " +
-            text
+            "Invalid value for " + option_name + ": " + text
         );
     }
 
     if (consumed != text.size()) {
         throw std::runtime_error(
-            "Invalid value for " +
-            option_name +
-            ": " +
-            text
+            "Invalid value for " + option_name + ": " + text
         );
     }
 
@@ -225,31 +413,25 @@ std::uint32_t parsePositiveUint32(
     const std::string& option_name
 ) {
     std::size_t consumed = 0;
-
     unsigned long value = 0;
 
     try {
         value = std::stoul(text, &consumed);
     } catch (const std::exception&) {
         throw std::runtime_error(
-            "Invalid value for " +
-            option_name +
-            ": " +
-            text
+            "Invalid value for " + option_name + ": " + text
         );
     }
 
     if (consumed != text.size() || value == 0) {
         throw std::runtime_error(
-            option_name +
-            " must be a positive integer"
+            option_name + " must be a positive integer"
         );
     }
 
     if (value > UINT32_MAX) {
         throw std::runtime_error(
-            option_name +
-            " is too large"
+            option_name + " is too large"
         );
     }
 
@@ -261,15 +443,14 @@ RecordStartArguments parseRecordStartArguments(
     char** argv
 ) {
     RecordStartArguments arguments;
-
     int index = 2;
 
     while (index < argc) {
-        if (consumePortOption(
+        if (consumeCommonOption(
                 argc,
                 argv,
                 index,
-                arguments.port
+                arguments.common
             )) {
             continue;
         }
@@ -284,10 +465,7 @@ RecordStartArguments parseRecordStartArguments(
             }
 
             arguments.sample_rate_hz =
-                parseFloat(
-                    argv[index + 1],
-                    "--rate"
-                );
+                parseFloat(argv[index + 1], "--rate");
 
             index += 2;
             continue;
@@ -311,8 +489,7 @@ RecordStartArguments parseRecordStartArguments(
         }
 
         throw std::runtime_error(
-            "Unknown option for record-start: " +
-            option
+            "Unknown option for record-start: " + option
         );
     }
 
@@ -324,25 +501,24 @@ SyncArguments parseSyncArguments(
     char** argv
 ) {
     SyncArguments arguments;
-
     int index = 2;
 
     while (index < argc) {
-        if (consumePortOption(
+        if (consumeCommonOption(
                 argc,
                 argv,
                 index,
-                arguments.port
+                arguments.common
             )) {
             continue;
         }
 
         const std::string option = argv[index];
 
-        if (option == "--out") {
+        if (option == "--out" || option == "--output-dir") {
             if (index + 1 >= argc) {
                 throw std::runtime_error(
-                    "--out requires a directory"
+                    option + " requires a directory"
                 );
             }
 
@@ -350,7 +526,7 @@ SyncArguments parseSyncArguments(
 
             if (arguments.output_path.empty()) {
                 throw std::runtime_error(
-                    "--out requires a non-empty directory"
+                    option + " requires a non-empty directory"
                 );
             }
 
@@ -359,8 +535,7 @@ SyncArguments parseSyncArguments(
         }
 
         throw std::runtime_error(
-            "Unknown option for sync: " +
-            option
+            "Unknown option for sync: " + option
         );
     }
 
@@ -368,169 +543,409 @@ SyncArguments parseSyncArguments(
 }
 
 std::string resolvePort(
-    const std::optional<std::string>& explicit_port
+    const CommonArguments& common
 ) {
     return headmotion::app::resolveDevicePort(
-        explicit_port
+        common.port,
+        common.device_id
     );
+}
+
+int normalizeBackendResult(
+    const std::string& command,
+    int backend_result,
+    bool json,
+    std::streambuf* json_buffer
+) {
+    const int process_result =
+        backend_result == 0
+            ? static_cast<int>(CliExitCode::success)
+            : static_cast<int>(CliExitCode::backend_failure);
+
+    if (json) {
+        emitCompleted(
+            command,
+            backend_result,
+            process_result,
+            json_buffer
+        );
+    }
+
+    return process_result;
+}
+
+int mapDevicePortError(
+    const headmotion::app::DevicePortError& error
+) {
+    using Reason = headmotion::app::DevicePortErrorReason;
+
+    switch (error.reason()) {
+        case Reason::no_serial_ports:
+        case Reason::no_mms_devices:
+            return static_cast<int>(CliExitCode::no_device);
+        case Reason::multiple_mms_devices:
+            return static_cast<int>(CliExitCode::ambiguous_device);
+        case Reason::device_id_not_found:
+            return static_cast<int>(CliExitCode::device_id_not_found);
+        case Reason::selector_conflict:
+        case Reason::invalid_selector:
+            return static_cast<int>(CliExitCode::selector_conflict);
+    }
+
+    return static_cast<int>(CliExitCode::unexpected_failure);
+}
+
+std::string devicePortErrorCode(
+    const headmotion::app::DevicePortError& error
+) {
+    using Reason = headmotion::app::DevicePortErrorReason;
+
+    switch (error.reason()) {
+        case Reason::no_serial_ports:
+        case Reason::no_mms_devices:
+            return "no_device";
+        case Reason::multiple_mms_devices:
+            return "ambiguous_device";
+        case Reason::device_id_not_found:
+            return "device_id_not_found";
+        case Reason::selector_conflict:
+            return "selector_conflict";
+        case Reason::invalid_selector:
+            return "invalid_selector";
+    }
+
+    return "device_error";
 }
 
 } // namespace
 
 int main(int argc, char** argv) {
+    const std::streambuf* const original_cout_const =
+        std::cout.rdbuf();
+    auto* const original_cout =
+        const_cast<std::streambuf*>(original_cout_const);
+
+    const bool requested_json =
+        argc >= 2 && rawFlagPresent(argc, argv, "--json");
+
+    const bool requested_quiet =
+        argc >= 2 && rawFlagPresent(argc, argv, "--quiet");
+
+    const std::string command =
+        argc >= 2 ? argv[1] : "";
+
     try {
         if (argc < 2) {
             printUsage(argv[0]);
-            return 1;
+            return static_cast<int>(CliExitCode::usage);
         }
 
-        const std::string command = argv[1];
-
         if (command == "scan") {
-            if (argc != 2) {
-                throw std::runtime_error(
-                    "scan does not accept any arguments"
+            const CommonArguments common =
+                parseCommonOnlyArguments(
+                    argc,
+                    argv,
+                    command,
+                    false
+                );
+
+            if (common.json) {
+                emitStarted(
+                    command,
+                    std::nullopt,
+                    std::nullopt,
+                    original_cout
                 );
             }
 
-            return headmotion::app::runScanPortsCommand();
+            ScopedCommandOutput output(
+                common.json || common.quiet
+            );
+
+            const int result =
+                headmotion::app::runScanPortsCommand();
+
+            return normalizeBackendResult(
+                command,
+                result,
+                common.json,
+                original_cout
+            );
         }
 
-        if (command == "identify") {
-            const auto arguments =
-                parsePortOnlyArguments(
+        if (
+            command == "identify" ||
+            command == "module-info" ||
+            command == "sdk-probe" ||
+            command == "record-stop" ||
+            command == "record-reset"
+        ) {
+            const CommonArguments common =
+                parseCommonOnlyArguments(
                     argc,
                     argv,
                     command
                 );
 
-            return headmotion::app::runIdentifyCommand(
-                resolvePort(arguments)
-            );
-        }
+            const std::string port =
+                resolvePort(common);
 
-        if (command == "module-info") {
-            const auto arguments =
-                parsePortOnlyArguments(
-                    argc,
-                    argv,
-                    command
+            if (common.json) {
+                emitStarted(
+                    command,
+                    port,
+                    common.device_id,
+                    original_cout
                 );
+            }
 
-            return headmotion::app::runModuleInfoCommand(
-                resolvePort(arguments)
+            ScopedCommandOutput output(
+                common.json || common.quiet
+            );
+
+            int result = 0;
+
+            if (command == "identify") {
+                result = headmotion::app::runIdentifyCommand(port);
+            } else if (command == "module-info") {
+                result = headmotion::app::runModuleInfoCommand(port);
+            } else if (command == "sdk-probe") {
+                result = headmotion::app::runSdkProbeCommand(port);
+            } else if (command == "record-stop") {
+                result = headmotion::app::runRecordStopCommand(port);
+            } else {
+                result = headmotion::app::runRecordResetCommand(port);
+            }
+
+            return normalizeBackendResult(
+                command,
+                result,
+                common.json,
+                original_cout
             );
         }
 
-        if (command == "sdk-probe") {
-            const auto arguments =
-                parsePortOnlyArguments(
-                    argc,
-                    argv,
-                    command
-                );
-
-            return headmotion::app::runSdkProbeCommand(
-                resolvePort(arguments)
-            );
-        }
-
-        if (command == "record-stop") {
-            const auto arguments =
-                parsePortOnlyArguments(
-                    argc,
-                    argv,
-                    command
-                );
-
-            return headmotion::app::runRecordStopCommand(
-                resolvePort(arguments)
-            );
-        }
-
-        if (command == "record-reset") {
-            const auto arguments =
-                parsePortOnlyArguments(
-                    argc,
-                    argv,
-                    command
-                );
-
-            return headmotion::app::runRecordResetCommand(
-                resolvePort(arguments)
-            );
-        }
-
-        if (command == "tx-raw") {
-            const auto arguments =
+        if (command == "tx-raw" || command == "cmd") {
+            const PortAndPayloadArguments arguments =
                 parsePortAndPayloadArguments(
                     argc,
                     argv,
                     command,
-                    "hex byte string"
+                    command == "tx-raw"
+                        ? "hex byte string"
+                        : "payload"
                 );
 
-            return headmotion::app::runRawTxCommand(
-                resolvePort(arguments.port),
-                arguments.payload
-            );
-        }
+            const std::string port =
+                resolvePort(arguments.common);
 
-        if (command == "cmd") {
-            const auto arguments =
-                parsePortAndPayloadArguments(
-                    argc,
-                    argv,
+            if (arguments.common.json) {
+                emitStarted(
                     command,
-                    "payload"
+                    port,
+                    arguments.common.device_id,
+                    original_cout
                 );
+            }
 
-            return headmotion::app::runCommandPayloadCommand(
-                resolvePort(arguments.port),
-                arguments.payload
+            ScopedCommandOutput output(
+                arguments.common.json ||
+                arguments.common.quiet
+            );
+
+            const int result =
+                command == "tx-raw"
+                    ? headmotion::app::runRawTxCommand(
+                        port,
+                        arguments.payload
+                    )
+                    : headmotion::app::runCommandPayloadCommand(
+                        port,
+                        arguments.payload
+                    );
+
+            return normalizeBackendResult(
+                command,
+                result,
+                arguments.common.json,
+                original_cout
             );
         }
 
         if (command == "record-start") {
             const RecordStartArguments arguments =
-                parseRecordStartArguments(
-                    argc,
-                    argv
+                parseRecordStartArguments(argc, argv);
+
+            const std::string port =
+                resolvePort(arguments.common);
+
+            if (arguments.common.json) {
+                emitStarted(
+                    command,
+                    port,
+                    arguments.common.device_id,
+                    original_cout
+                );
+            }
+
+            ScopedCommandOutput output(
+                arguments.common.json ||
+                arguments.common.quiet
+            );
+
+            const int result =
+                headmotion::app::runRecordStartCommand(
+                    port,
+                    arguments.sample_rate_hz,
+                    arguments.battery_interval_seconds
                 );
 
-            return headmotion::app::runRecordStartCommand(
-                resolvePort(arguments.port),
-                arguments.sample_rate_hz,
-                arguments.battery_interval_seconds
+            return normalizeBackendResult(
+                command,
+                result,
+                arguments.common.json,
+                original_cout
             );
         }
 
         if (command == "sync") {
             const SyncArguments arguments =
-                parseSyncArguments(
-                    argc,
-                    argv
+                parseSyncArguments(argc, argv);
+
+            const std::string port =
+                resolvePort(arguments.common);
+
+            if (arguments.common.json) {
+                emitStarted(
+                    command,
+                    port,
+                    arguments.common.device_id,
+                    original_cout
+                );
+            }
+
+            ScopedCommandOutput output(
+                arguments.common.json ||
+                arguments.common.quiet
+            );
+
+            const int result =
+                headmotion::app::runSyncCommand(
+                    port,
+                    arguments.output_path,
+                    [
+                        json = arguments.common.json,
+                        original_cout
+                    ](
+                        std::uint32_t entries_left,
+                        std::uint32_t total_entries
+                    ) {
+                        if (!json) {
+                            return;
+                        }
+
+                        const double percent =
+                            total_entries == 0
+                                ? 100.0
+                                : 100.0 *
+                                    static_cast<double>(
+                                        total_entries - entries_left
+                                    ) /
+                                    static_cast<double>(total_entries);
+
+                        std::ostringstream line;
+                        line
+                            << "{\"event\":\"progress\","
+                            << "\"command\":\"sync\","
+                            << "\"entries_left\":"
+                            << entries_left
+                            << ",\"total_entries\":"
+                            << total_entries
+                            << ",\"percent\":"
+                            << percent
+                            << "}";
+
+                        emitJson(
+                            line.str(),
+                            original_cout
+                        );
+                    }
                 );
 
-            return headmotion::app::runSyncCommand(
-                resolvePort(arguments.port),
-                arguments.output_path
+            return normalizeBackendResult(
+                command,
+                result,
+                arguments.common.json,
+                original_cout
             );
         }
 
-        std::cerr
-            << "Unknown command: "
-            << command
-            << "\n\n";
+        throw std::runtime_error(
+            "Unknown command: " + command
+        );
 
-        printUsage(argv[0]);
-        return 1;
+    } catch (const headmotion::app::DevicePortError& error) {
+        const int exit_code =
+            mapDevicePortError(error);
+
+        if (requested_json) {
+            emitError(
+                command,
+                devicePortErrorCode(error),
+                error.what(),
+                exit_code,
+                original_cout
+            );
+        } else if (!requested_quiet) {
+            std::cerr
+                << "ERROR: "
+                << error.what()
+                << "\n";
+        }
+
+        return exit_code;
+
+    } catch (const std::runtime_error& error) {
+        const int exit_code =
+            static_cast<int>(CliExitCode::usage);
+
+        if (requested_json) {
+            emitError(
+                command,
+                "invalid_arguments",
+                error.what(),
+                exit_code,
+                original_cout
+            );
+        } else if (!requested_quiet) {
+            std::cerr
+                << "ERROR: "
+                << error.what()
+                << "\n\n";
+            printUsage(argv[0]);
+        }
+
+        return exit_code;
+
     } catch (const std::exception& error) {
-        std::cerr
-            << "ERROR: "
-            << error.what()
-            << "\n";
+        const int exit_code =
+            static_cast<int>(CliExitCode::unexpected_failure);
 
-        return 1;
+        if (requested_json) {
+            emitError(
+                command,
+                "unexpected_failure",
+                error.what(),
+                exit_code,
+                original_cout
+            );
+        } else if (!requested_quiet) {
+            std::cerr
+                << "ERROR: "
+                << error.what()
+                << "\n";
+        }
+
+        return exit_code;
     }
 }
