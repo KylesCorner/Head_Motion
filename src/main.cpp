@@ -1,15 +1,20 @@
 #include "headmotion/app/Commands.hpp"
 #include "headmotion/app/DevicePortResolver.hpp"
+#include "headmotion/app/MmsDeviceProbe.hpp"
+#include "headmotion/transport/SerialPortFactory.hpp"
+#include "headmotion/transport/SerialPortInfo.hpp"
 
-#include <algorithm>
 #include <cstdint>
 #include <exception>
+#include <iomanip>
 #include <iostream>
 #include <optional>
 #include <sstream>
 #include <stdexcept>
 #include <streambuf>
 #include <string>
+#include <utility>
+#include <vector>
 
 namespace {
 
@@ -45,6 +50,13 @@ struct SyncArguments {
 struct PortAndPayloadArguments {
     CommonArguments common;
     std::string payload;
+};
+
+class BackendExecutionError final : public std::runtime_error {
+public:
+    explicit BackendExecutionError(const std::string& message)
+        : std::runtime_error(message) {
+    }
 };
 
 class NullBuffer final : public std::streambuf {
@@ -202,6 +214,127 @@ bool rawFlagPresent(
     }
 
     return false;
+}
+
+constexpr std::uint16_t MMS_VENDOR_ID = 0x1915;
+constexpr std::uint16_t MMS_PRODUCT_ID = 0xd978;
+
+bool isMmsCandidate(
+    const headmotion::transport::SerialPortInfo& port
+) {
+    return
+        (
+            port.vendor_id == MMS_VENDOR_ID &&
+            port.product_id == MMS_PRODUCT_ID
+        ) ||
+        port.likely_mms;
+}
+
+std::string stableDeviceId(
+    const headmotion::transport::SerialPortInfo& port
+) {
+    if (!port.serial_number.empty()) {
+        return port.serial_number;
+    }
+
+    if (!port.symlink_path.empty()) {
+        constexpr const char* marker =
+            "usb-MbientLab_MetaMotionS_";
+
+        const std::size_t begin =
+            port.symlink_path.find(marker);
+
+        if (begin != std::string::npos) {
+            const std::size_t serial_begin =
+                begin + std::string(marker).size();
+
+            const std::size_t serial_end =
+                port.symlink_path.find(
+                    "-if",
+                    serial_begin
+                );
+
+            if (
+                serial_end != std::string::npos &&
+                serial_end > serial_begin
+            ) {
+                return port.symlink_path.substr(
+                    serial_begin,
+                    serial_end - serial_begin
+                );
+            }
+        }
+    }
+
+    return {};
+}
+
+int runJsonScan(
+    std::streambuf* output_buffer
+) {
+    const auto ports =
+        headmotion::transport::SerialPortFactory::listPorts();
+
+    if (ports.empty()) {
+        return 2;
+    }
+
+    std::uint32_t verified_count = 0;
+
+    for (const auto& port : ports) {
+        if (!isMmsCandidate(port)) {
+            continue;
+        }
+
+        const auto probe =
+            headmotion::app::probeMmsDevice(
+                port.preferredPath()
+            );
+
+        if (!probe.has_value()) {
+            continue;
+        }
+
+        ++verified_count;
+
+        std::ostringstream line;
+        line
+            << "{\"event\":\"device\","
+            << "\"port\":\""
+            << jsonEscape(port.preferredPath())
+            << "\",\"system_port\":\""
+            << jsonEscape(port.path)
+            << "\",\"identity\":\""
+            << jsonEscape(probe->identity)
+            << "\",\"vendor_id\":"
+            << port.vendor_id
+            << ",\"product_id\":"
+            << port.product_id;
+
+        const std::string device_id =
+            stableDeviceId(port);
+
+        if (!device_id.empty()) {
+            line
+                << ",\"device_id\":\""
+                << jsonEscape(device_id)
+                << "\"";
+        }
+
+        line << "}";
+        emitJson(line.str(), output_buffer);
+    }
+
+    std::ostringstream summary;
+    summary
+        << "{\"event\":\"scan_summary\","
+        << "\"verified_devices\":"
+        << verified_count
+        << "}";
+
+    emitJson(summary.str(), output_buffer);
+
+    return verified_count == 0 ? 3 : 0;
 }
 
 void printUsage(const char* argv0) {
@@ -551,6 +684,19 @@ std::string resolvePort(
     );
 }
 
+template <typename Function>
+int invokeBackend(Function&& function) {
+    try {
+        return std::forward<Function>(function)();
+    } catch (const std::exception& error) {
+        throw BackendExecutionError(error.what());
+    } catch (...) {
+        throw BackendExecutionError(
+            "backend command failed with an unknown exception"
+        );
+    }
+}
+
 int normalizeBackendResult(
     const std::string& command,
     int backend_result,
@@ -620,10 +766,8 @@ std::string devicePortErrorCode(
 } // namespace
 
 int main(int argc, char** argv) {
-    const std::streambuf* const original_cout_const =
+    std::streambuf* const original_cout =
         std::cout.rdbuf();
-    auto* const original_cout =
-        const_cast<std::streambuf*>(original_cout_const);
 
     const bool requested_json =
         argc >= 2 && rawFlagPresent(argc, argv, "--json");
@@ -663,7 +807,17 @@ int main(int argc, char** argv) {
             );
 
             const int result =
-                headmotion::app::runScanPortsCommand();
+                common.json
+                    ? invokeBackend(
+                        [&] {
+                            return runJsonScan(original_cout);
+                        }
+                    )
+                    : invokeBackend(
+                        [] {
+                            return headmotion::app::runScanPortsCommand();
+                        }
+                    );
 
             return normalizeBackendResult(
                 command,
@@ -703,19 +857,28 @@ int main(int argc, char** argv) {
                 common.json || common.quiet
             );
 
-            int result = 0;
+            const int result =
+                invokeBackend(
+                    [&] {
+                        if (command == "identify") {
+                            return headmotion::app::runIdentifyCommand(port);
+                        }
 
-            if (command == "identify") {
-                result = headmotion::app::runIdentifyCommand(port);
-            } else if (command == "module-info") {
-                result = headmotion::app::runModuleInfoCommand(port);
-            } else if (command == "sdk-probe") {
-                result = headmotion::app::runSdkProbeCommand(port);
-            } else if (command == "record-stop") {
-                result = headmotion::app::runRecordStopCommand(port);
-            } else {
-                result = headmotion::app::runRecordResetCommand(port);
-            }
+                        if (command == "module-info") {
+                            return headmotion::app::runModuleInfoCommand(port);
+                        }
+
+                        if (command == "sdk-probe") {
+                            return headmotion::app::runSdkProbeCommand(port);
+                        }
+
+                        if (command == "record-stop") {
+                            return headmotion::app::runRecordStopCommand(port);
+                        }
+
+                        return headmotion::app::runRecordResetCommand(port);
+                    }
+                );
 
             return normalizeBackendResult(
                 command,
@@ -754,15 +917,19 @@ int main(int argc, char** argv) {
             );
 
             const int result =
-                command == "tx-raw"
-                    ? headmotion::app::runRawTxCommand(
-                        port,
-                        arguments.payload
-                    )
-                    : headmotion::app::runCommandPayloadCommand(
-                        port,
-                        arguments.payload
-                    );
+                invokeBackend(
+                    [&] {
+                        return command == "tx-raw"
+                            ? headmotion::app::runRawTxCommand(
+                                port,
+                                arguments.payload
+                            )
+                            : headmotion::app::runCommandPayloadCommand(
+                                port,
+                                arguments.payload
+                            );
+                    }
+                );
 
             return normalizeBackendResult(
                 command,
@@ -794,10 +961,14 @@ int main(int argc, char** argv) {
             );
 
             const int result =
-                headmotion::app::runRecordStartCommand(
-                    port,
-                    arguments.sample_rate_hz,
-                    arguments.battery_interval_seconds
+                invokeBackend(
+                    [&] {
+                        return headmotion::app::runRecordStartCommand(
+                            port,
+                            arguments.sample_rate_hz,
+                            arguments.battery_interval_seconds
+                        );
+                    }
                 );
 
             return normalizeBackendResult(
@@ -830,44 +1001,48 @@ int main(int argc, char** argv) {
             );
 
             const int result =
-                headmotion::app::runSyncCommand(
-                    port,
-                    arguments.output_path,
-                    [
-                        json = arguments.common.json,
-                        original_cout
-                    ](
-                        std::uint32_t entries_left,
-                        std::uint32_t total_entries
-                    ) {
-                        if (!json) {
-                            return;
-                        }
+                invokeBackend(
+                    [&] {
+                        return headmotion::app::runSyncCommand(
+                            port,
+                            arguments.output_path,
+                            [
+                                json = arguments.common.json,
+                                original_cout
+                            ](
+                                std::uint32_t entries_left,
+                                std::uint32_t total_entries
+                            ) {
+                                if (!json) {
+                                    return;
+                                }
 
-                        const double percent =
-                            total_entries == 0
-                                ? 100.0
-                                : 100.0 *
-                                    static_cast<double>(
-                                        total_entries - entries_left
-                                    ) /
-                                    static_cast<double>(total_entries);
+                                const double percent =
+                                    total_entries == 0
+                                        ? 100.0
+                                        : 100.0 *
+                                            static_cast<double>(
+                                                total_entries - entries_left
+                                            ) /
+                                            static_cast<double>(total_entries);
 
-                        std::ostringstream line;
-                        line
-                            << "{\"event\":\"progress\","
-                            << "\"command\":\"sync\","
-                            << "\"entries_left\":"
-                            << entries_left
-                            << ",\"total_entries\":"
-                            << total_entries
-                            << ",\"percent\":"
-                            << percent
-                            << "}";
+                                std::ostringstream line;
+                                line
+                                    << "{\"event\":\"progress\","
+                                    << "\"command\":\"sync\","
+                                    << "\"entries_left\":"
+                                    << entries_left
+                                    << ",\"total_entries\":"
+                                    << total_entries
+                                    << ",\"percent\":"
+                                    << percent
+                                    << "}";
 
-                        emitJson(
-                            line.str(),
-                            original_cout
+                                emitJson(
+                                    line.str(),
+                                    original_cout
+                                );
+                            }
                         );
                     }
                 );
@@ -892,6 +1067,27 @@ int main(int argc, char** argv) {
             emitError(
                 command,
                 devicePortErrorCode(error),
+                error.what(),
+                exit_code,
+                original_cout
+            );
+        } else if (!requested_quiet) {
+            std::cerr
+                << "ERROR: "
+                << error.what()
+                << "\n";
+        }
+
+        return exit_code;
+
+    } catch (const BackendExecutionError& error) {
+        const int exit_code =
+            static_cast<int>(CliExitCode::backend_failure);
+
+        if (requested_json) {
+            emitError(
+                command,
+                "backend_exception",
                 error.what(),
                 exit_code,
                 original_cout
