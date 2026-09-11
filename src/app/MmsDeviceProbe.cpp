@@ -3,6 +3,8 @@
 #include "headmotion/transport/SerialConfig.hpp"
 #include "headmotion/transport/SerialPortFactory.hpp"
 
+#include <algorithm>
+#include <cctype>
 #include <chrono>
 #include <cstdint>
 #include <string>
@@ -10,123 +12,177 @@
 
 namespace headmotion::app {
 
-std::optional<MmsProbeResult> probeMmsDevice(
-    const std::string& port_name
-) {
-    using namespace std::chrono_literals;
+    std::string deviceIdFromMmsIdentity(
+        const std::string& identity
+    ) {
+        if (identity.empty()) {
+            return {};
+        }
 
-    try {
-        headmotion::transport::SerialConfig config;
-
-        config.port_name = port_name;
-        config.baud_rate = 115200;
-        config.data_bits = 8;
-        config.stop_bits = 1;
-        config.assert_dtr = true;
-        config.assert_rts = true;
-        config.open_delay = 100ms;
-
-        auto port =
-            headmotion::transport::SerialPortFactory::
-                create(config);
-
-        port->open();
-
-        /*
-         * MMS identity query.
-         */
-        const std::vector<std::uint8_t> query = {
-            static_cast<std::uint8_t>('?'),
-            static_cast<std::uint8_t>('\n')
-        };
-
-        port->write(query);
-
-        std::vector<std::uint8_t> response;
-
-        const auto deadline =
-            std::chrono::steady_clock::now() +
-            1500ms;
+        std::size_t end = identity.size();
 
         while (
-            std::chrono::steady_clock::now() <
-            deadline
-        ) {
-            auto chunk =
-                port->read(
-                    256,
-                    200ms
+            end > 0 &&
+            std::isspace(
+                static_cast<unsigned char>(
+                    identity[end - 1]
+                    )
+            )
+            ) {
+            --end;
+        }
+
+        if (end == 0) {
+            return {};
+        }
+
+        const std::size_t separator =
+            identity.find_last_of(
+                " \t\r\n",
+                end - 1
+            );
+
+        const std::size_t begin =
+            separator == std::string::npos
+            ? 0
+            : separator + 1;
+
+        if (begin >= end) {
+            return {};
+        }
+
+        const std::string candidate =
+            identity.substr(
+                begin,
+                end - begin
+            );
+
+        /*
+         * Current MMS+ identity strings end in a hexadecimal board serial
+         * such as 0561F6.  Keep the check deliberately conservative so we
+         * do not accidentally treat firmware/model text as a device ID.
+         */
+        if (
+            candidate.size() < 4 ||
+            !std::all_of(
+                candidate.begin(),
+                candidate.end(),
+                [](unsigned char ch) {
+                    return std::isxdigit(ch) != 0;
+                }
+            )
+            ) {
+            return {};
+        }
+
+        return candidate;
+    }
+
+    std::optional<MmsProbeResult> probeMmsDevice(
+        const std::string& port_name
+    ) {
+        using namespace std::chrono_literals;
+
+        try {
+            headmotion::transport::SerialConfig config;
+
+            config.port_name = port_name;
+            config.baud_rate = 115200;
+            config.data_bits = 8;
+            config.stop_bits = 1;
+            config.assert_dtr = true;
+            config.assert_rts = true;
+            config.open_delay = 100ms;
+
+            auto port =
+                headmotion::transport::SerialPortFactory::
+                create(config);
+
+            port->open();
+
+            const std::vector<std::uint8_t> query = {
+                static_cast<std::uint8_t>('?'),
+                static_cast<std::uint8_t>('\n')
+            };
+
+            port->write(query);
+
+            std::vector<std::uint8_t> response;
+
+            const auto deadline =
+                std::chrono::steady_clock::now() +
+                1500ms;
+
+            while (
+                std::chrono::steady_clock::now() <
+                deadline
+                ) {
+                auto chunk =
+                    port->read(
+                        256,
+                        200ms
+                    );
+
+                if (!chunk.empty()) {
+                    response.insert(
+                        response.end(),
+                        chunk.begin(),
+                        chunk.end()
+                    );
+                }
+
+                const std::string text(
+                    response.begin(),
+                    response.end()
                 );
 
-            if (!chunk.empty()) {
-                response.insert(
-                    response.end(),
-                    chunk.begin(),
-                    chunk.end()
-                );
+                if (
+                    text.find('\n') !=
+                    std::string::npos
+                    ) {
+                    break;
+                }
             }
 
-            const std::string text(
+            if (response.empty()) {
+                return std::nullopt;
+            }
+
+            std::string identity(
                 response.begin(),
                 response.end()
             );
 
-            if (
-                text.find('\n') !=
-                std::string::npos
-            ) {
-                break;
+            while (
+                !identity.empty() &&
+                (
+                    identity.back() == '\n' ||
+                    identity.back() == '\r'
+                    )
+                ) {
+                identity.pop_back();
             }
-        }
 
-        if (response.empty()) {
-            return std::nullopt;
-        }
-
-        std::string identity(
-            response.begin(),
-            response.end()
-        );
-
-        /*
-         * Strip line endings from the identity response so callers can
-         * safely print/store it without introducing extra lines.
-         */
-        while (
-            !identity.empty() &&
-            (
-                identity.back() == '\n' ||
-                identity.back() == '\r'
-            )
-        ) {
-            identity.pop_back();
-        }
-
-        const bool verified =
-            identity.find("MetaMotionS") !=
+            const bool verified =
+                identity.find("MetaMotionS") !=
                 std::string::npos ||
-            identity.find("MetaWear") !=
+                identity.find("MetaWear") !=
                 std::string::npos ||
-            identity.find("MbientLab") !=
+                identity.find("MbientLab") !=
                 std::string::npos;
 
-        if (!verified) {
+            if (!verified) {
+                return std::nullopt;
+            }
+
+            return MmsProbeResult{
+                .identity = identity
+            };
+
+        }
+        catch (...) {
             return std::nullopt;
         }
-
-        return MmsProbeResult{
-            .identity = identity
-        };
-
-    } catch (...) {
-        /*
-         * Probe failures are intentionally non-fatal.
-         *
-         * scan-ports may have several candidates and should continue
-         * probing the remaining devices if one cannot be opened.
-         */
-        return std::nullopt;
     }
-}
 
 } // namespace headmotion::app
