@@ -622,4 +622,141 @@ void MetaWearSdkBridge::initializedThunk(
     std::cout << "SDK initialized callback status=" << status << "\n";
 }
 
+bool MetaWearSdkBridge::discoverAnonymousSignals(
+    int timeout_ms
+) {
+    if (board_ == nullptr) {
+        throw std::runtime_error(
+            "Cannot discover anonymous signals on null board"
+        );
+    }
+
+    if (!initialized()) {
+        throw std::runtime_error(
+            "Cannot discover anonymous signals before SDK initialization"
+        );
+    }
+
+    anonymous_signals_.clear();
+    anonymous_discovery_done_ = false;
+    anonymous_discovery_status_ = -999;
+
+    std::cout
+        << "SDK: discovering anonymous logger signals\n";
+
+    mbl_mw_metawearboard_create_anonymous_datasignals(
+        board_,
+        this,
+        &MetaWearSdkBridge::anonymousSignalsCreatedThunk
+    );
+
+    const auto deadline =
+        std::chrono::steady_clock::now() +
+        std::chrono::milliseconds(timeout_ms);
+
+    while (
+        std::chrono::steady_clock::now() < deadline
+        ) {
+        pumpOnce(100);
+
+        if (anonymous_discovery_done_.load()) {
+            break;
+        }
+
+        std::this_thread::sleep_for(
+            std::chrono::milliseconds(10)
+        );
+    }
+
+    if (!anonymous_discovery_done_.load()) {
+        anonymous_discovery_status_ = -1;
+
+        std::cerr
+            << "SDK: anonymous signal discovery timed out\n";
+
+        return false;
+    }
+
+    return anonymous_discovery_status_.load() == 0;
+}
+
+void MetaWearSdkBridge::anonymousSignalsCreatedThunk(
+    void* context,
+    MblMwMetaWearBoard* board,
+    MblMwAnonymousDataSignal** signals,
+    std::uint32_t size
+) {
+    (void)board;
+
+    auto* self =
+        static_cast<MetaWearSdkBridge*>(context);
+
+    if (self == nullptr) {
+        return;
+    }
+
+    self->anonymous_signals_.clear();
+
+    /*
+     * The SDK uses signals == nullptr to report failure.
+     *
+     * Internally it passes an SDK status code through the
+     * size argument on failure.
+     *
+     * size == 0 is also a legitimate "no loggers" result,
+     * so treat nullptr + 0 as successful discovery of an
+     * empty logger set.
+     */
+    if (signals == nullptr) {
+        if (size == 0) {
+            self->anonymous_discovery_status_ = 0;
+        }
+        else {
+            self->anonymous_discovery_status_ =
+                static_cast<std::int32_t>(size);
+        }
+
+        self->anonymous_discovery_done_ = true;
+        return;
+    }
+
+    self->anonymous_signals_.reserve(size);
+
+    for (std::uint32_t i = 0; i < size; ++i) {
+        MblMwAnonymousDataSignal* signal =
+            signals[i];
+
+        if (signal == nullptr) {
+            continue;
+        }
+
+        const char* identifier =
+            mbl_mw_anonymous_datasignal_get_identifier(
+                signal
+            );
+
+        AnonymousSignalInfo info;
+        info.signal = signal;
+
+        if (identifier != nullptr) {
+            info.identifier = identifier;
+        }
+
+        self->anonymous_signals_.push_back(
+            std::move(info)
+        );
+    }
+
+    self->anonymous_discovery_status_ = 0;
+    self->anonymous_discovery_done_ = true;
+}
+const std::vector<AnonymousSignalInfo>&
+MetaWearSdkBridge::anonymousSignals() const {
+    return anonymous_signals_;
+}
+
+int MetaWearSdkBridge::anonymousDiscoveryStatus() const {
+    return anonymous_discovery_status_.load();
+}
+
 } // namespace headmotion::sdk

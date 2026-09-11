@@ -7,12 +7,19 @@
 #include <string>
 #include <vector>
 
+
 extern "C" {
+#include "metawear/core/anonymous_datasignal.h"
 #include "metawear/core/metawearboard.h"
 #include "metawear/platform/btle_connection.h"
 }
 
 namespace headmotion::sdk {
+
+    struct AnonymousSignalInfo {
+        MblMwAnonymousDataSignal* signal = nullptr;
+        std::string identifier;
+    };
 
 class MetaWearSdkBridge {
 public:
@@ -35,6 +42,13 @@ public:
     std::vector<std::uint8_t> serializeBoard() const;
     void deserializeBoard(const std::vector<std::uint8_t>& state);
 
+    bool discoverAnonymousSignals(int timeout_ms);
+
+    const std::vector<AnonymousSignalInfo>&
+        anonymousSignals() const;
+
+    int anonymousDiscoveryStatus() const;
+
 private:
     headmotion::metawear::MetaWearUsbTransport& usb_;
 
@@ -51,6 +65,18 @@ private:
 
     std::atomic<bool> initialized_{false};
     std::atomic<int> initialize_status_{-999};
+
+    std::atomic<bool> anonymous_discovery_done_{ false };
+    std::atomic<int> anonymous_discovery_status_{ -999 };
+
+    std::vector<AnonymousSignalInfo> anonymous_signals_;
+
+    static void anonymousSignalsCreatedThunk(
+        void* context,
+        MblMwMetaWearBoard* board,
+        MblMwAnonymousDataSignal** signals,
+        std::uint32_t size
+    );
 
     int dis_read_count_ = 0;
 
