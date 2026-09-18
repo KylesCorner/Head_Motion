@@ -330,7 +330,7 @@ void setCellText(
     }
 
     const int inner_width =
-        std::max(1, box->w() - 10);
+        (std::max)(1, box->w() - 10);
 
     const std::string clipped =
         truncateToPixelWidth(
@@ -1732,7 +1732,10 @@ void MainWindow::updateProgressUi() {
         }
 
         total += device_total;
-        left += std::min(device_left, device_total);
+        left += (std::min)(
+            device_left,
+            device_total
+            );
         ++active_progress_devices;
     }
 

@@ -26,14 +26,36 @@ namespace {
     };
 
     /*
-     * Determine a stable hardware identifier for display/runtime use.
+     * Determine a stable MMS+ hardware identifier.
      *
-     * IMPORTANT:
-     * This value is NOT persisted anywhere on the host.
+     * Prefer the board ID reported by the MMS identity response.  That value is
+     * available on every supported platform and avoids depending on whether the
+     * operating system exposes the USB CDC serial number.
+     *
+     * Example identity:
+     *
+     *   MbientLab MetaMotionS 8 0.1 1.7.2 0561E1
+     *
+     * becomes:
+     *
+     *   0561E1
+     *
+     * USB metadata remains as a fallback in case an older firmware does not
+     * provide a usable board ID.
      */
     std::string stableDeviceId(
-        const headmotion::transport::SerialPortInfo& port
+        const headmotion::transport::SerialPortInfo& port,
+        const std::string& identity
     ) {
+        const std::string board_id =
+            headmotion::app::deviceIdFromMmsIdentity(
+                identity
+            );
+
+        if (!board_id.empty()) {
+            return board_id;
+        }
+
         if (!port.serial_number.empty()) {
             return port.serial_number;
         }
@@ -43,7 +65,9 @@ namespace {
                 "usb-MbientLab_MetaMotionS_";
 
             const std::size_t begin =
-                port.symlink_path.find(marker);
+                port.symlink_path.find(
+                    marker
+                );
 
             if (begin != std::string::npos) {
                 const std::size_t serial_begin =
@@ -59,7 +83,7 @@ namespace {
                 if (
                     serial_end != std::string::npos &&
                     serial_end > serial_begin
-                ) {
+                    ) {
                     return port.symlink_path.substr(
                         serial_begin,
                         serial_end - serial_begin
@@ -110,7 +134,8 @@ namespace headmotion::app {
             }
         );
 
-        std::vector<VerifiedMms> verified_devices;
+        std::vector<VerifiedMms>
+            verified_devices;
 
         for (const auto& port : ports) {
             const bool candidate =
@@ -169,7 +194,10 @@ namespace headmotion::app {
             }
 
             const std::string device_id =
-                stableDeviceId(port);
+                stableDeviceId(
+                    port,
+                    probe->identity
+                );
 
             output.event(
                 "device",
