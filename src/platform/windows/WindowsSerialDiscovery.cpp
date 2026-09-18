@@ -379,6 +379,165 @@ bool isComPortName(const std::string& value) {
     );
 }
 
+void appendWineRegistryPorts(
+    std::vector<headmotion::transport::SerialPortInfo>& ports
+) {
+    HKEY key = nullptr;
+
+    const LONG open_result = RegOpenKeyExW(
+        HKEY_LOCAL_MACHINE,
+        L"Software\\Wine\\Ports",
+        0,
+        KEY_READ,
+        &key
+    );
+
+    if (open_result != ERROR_SUCCESS) {
+        // Expected on normal Windows installations.
+        return;
+    }
+
+    DWORD value_count = 0;
+    DWORD max_value_name_chars = 0;
+    DWORD max_value_data_bytes = 0;
+
+    const LONG query_result = RegQueryInfoKeyW(
+        key,
+        nullptr,
+        nullptr,
+        nullptr,
+        nullptr,
+        nullptr,
+        nullptr,
+        &value_count,
+        &max_value_name_chars,
+        &max_value_data_bytes,
+        nullptr,
+        nullptr
+    );
+
+    if (query_result != ERROR_SUCCESS) {
+        RegCloseKey(key);
+        return;
+    }
+
+    std::vector<wchar_t> value_name(
+        static_cast<std::size_t>(max_value_name_chars) + 2,
+        L'\0'
+    );
+
+    std::vector<BYTE> value_data(
+        static_cast<std::size_t>(max_value_data_bytes) +
+            sizeof(wchar_t),
+        0
+    );
+
+    for (DWORD index = 0; index < value_count; ++index) {
+        std::fill(
+            value_name.begin(),
+            value_name.end(),
+            L'\0'
+        );
+
+        std::fill(
+            value_data.begin(),
+            value_data.end(),
+            0
+        );
+
+        DWORD value_name_length =
+            static_cast<DWORD>(
+                value_name.size() - 1
+            );
+
+        DWORD value_data_size =
+            static_cast<DWORD>(
+                value_data.size() - sizeof(wchar_t)
+            );
+
+        DWORD value_type = 0;
+
+        const LONG result = RegEnumValueW(
+            key,
+            index,
+            value_name.data(),
+            &value_name_length,
+            nullptr,
+            &value_type,
+            value_data.data(),
+            &value_data_size
+        );
+
+        if (result != ERROR_SUCCESS) {
+            continue;
+        }
+
+        if (value_type != REG_SZ &&
+            value_type != REG_EXPAND_SZ) {
+            continue;
+        }
+
+        const std::string port_name =
+            wideToUtf8(
+                std::wstring(
+                    value_name.data(),
+                    value_name_length
+                )
+            );
+
+        if (!isComPortName(port_name)) {
+            continue;
+        }
+
+        const bool already_present =
+            std::any_of(
+                ports.begin(),
+                ports.end(),
+                [&](const auto& port) {
+                    return upperCopy(port.path) ==
+                           upperCopy(port_name);
+                }
+            );
+
+        if (already_present) {
+            continue;
+        }
+
+        const auto* mapped_path_w =
+            reinterpret_cast<const wchar_t*>(
+                value_data.data()
+            );
+
+        const std::string mapped_path =
+            wideToUtf8(
+                std::wstring(mapped_path_w)
+            );
+
+        headmotion::transport::SerialPortInfo info;
+
+        info.path = upperCopy(port_name);
+        info.display_name =
+            "Wine serial port " + info.path;
+
+        info.manufacturer = "Wine";
+        info.product_name = mapped_path;
+
+        /*
+         * Wine does not reliably expose manually mapped serial ports through
+         * SetupAPI with USB VID/PID metadata. Treat explicitly registered Wine
+         * ports as candidates and let probeMmsDevice() perform the actual MMS+
+         * protocol verification.
+         */
+        info.likely_mms = true;
+
+        ports.push_back(
+            std::move(info)
+        );
+    }
+
+    RegCloseKey(key);
+}
+
 } // namespace
 
 std::vector<headmotion::transport::SerialPortInfo>
@@ -393,194 +552,222 @@ WindowsSerialDiscovery::listPorts() const {
             DIGCF_PRESENT
         );
 
-    if (raw_device_info_set == INVALID_HANDLE_VALUE) {
-        const DWORD error = GetLastError();
-
-        throw std::runtime_error(
-            windowsErrorMessage(
-                "SetupDiGetClassDevsW",
-                error
-            )
+    if (raw_device_info_set != INVALID_HANDLE_VALUE) {
+        DeviceInfoSet device_info_set(
+            raw_device_info_set
         );
-    }
 
-    DeviceInfoSet device_info_set(
-        raw_device_info_set
-    );
+        for (DWORD index = 0;; ++index) {
+            SP_DEVINFO_DATA device_info{};
+            device_info.cbSize = sizeof(device_info);
 
-    for (DWORD index = 0;; ++index) {
-        SP_DEVINFO_DATA device_info{};
-        device_info.cbSize = sizeof(device_info);
+            if (!SetupDiEnumDeviceInfo(
+                    device_info_set.get(),
+                    index,
+                    &device_info
+                )) {
+                const DWORD error = GetLastError();
 
-        if (!SetupDiEnumDeviceInfo(
-                device_info_set.get(),
-                index,
-                &device_info
-            )) {
-            const DWORD error = GetLastError();
+                if (error == ERROR_NO_MORE_ITEMS) {
+                    break;
+                }
 
-            if (error == ERROR_NO_MORE_ITEMS) {
-                break;
+                throw std::runtime_error(
+                    windowsErrorMessage(
+                        "SetupDiEnumDeviceInfo",
+                        error
+                    )
+                );
             }
 
-            throw std::runtime_error(
-                windowsErrorMessage(
-                    "SetupDiEnumDeviceInfo",
-                    error
-                )
-            );
-        }
-
-        const auto port_name_w =
-            getPortName(
-                device_info_set.get(),
-                device_info
-            );
-
-        if (!port_name_w) {
-            continue;
-        }
-
-        const std::string port_name =
-            wideToUtf8(*port_name_w);
-
-        if (!isComPortName(port_name)) {
-            continue;
-        }
-
-        headmotion::transport::SerialPortInfo info;
-
-        info.path = port_name;
-        info.symlink_path.clear();
-
-        if (const auto friendly =
-                getDevicePropertyString(
+            const auto port_name_w =
+                getPortName(
                     device_info_set.get(),
-                    device_info,
-                    SPDRP_FRIENDLYNAME
-                )) {
-            info.display_name =
-                wideToUtf8(*friendly);
-        }
+                    device_info
+                );
 
-        if (info.display_name.empty()) {
+            if (!port_name_w) {
+                continue;
+            }
+
+            const std::string port_name =
+                wideToUtf8(*port_name_w);
+
+            if (!isComPortName(port_name)) {
+                continue;
+            }
+
+            headmotion::transport::SerialPortInfo info;
+
+            info.path = port_name;
+            info.symlink_path.clear();
+
+            if (const auto friendly =
+                    getDevicePropertyString(
+                        device_info_set.get(),
+                        device_info,
+                        SPDRP_FRIENDLYNAME
+                    )) {
+                info.display_name =
+                    wideToUtf8(*friendly);
+            }
+
+            if (info.display_name.empty()) {
+                if (const auto description =
+                        getDevicePropertyString(
+                            device_info_set.get(),
+                            device_info,
+                            SPDRP_DEVICEDESC
+                        )) {
+                    info.display_name =
+                        wideToUtf8(*description);
+                }
+            }
+
+            if (info.display_name.empty()) {
+                info.display_name = port_name;
+            }
+
+            if (const auto manufacturer =
+                    getDevicePropertyString(
+                        device_info_set.get(),
+                        device_info,
+                        SPDRP_MFG
+                    )) {
+                info.manufacturer =
+                    wideToUtf8(*manufacturer);
+            }
+
             if (const auto description =
                     getDevicePropertyString(
                         device_info_set.get(),
                         device_info,
                         SPDRP_DEVICEDESC
                     )) {
-                info.display_name =
+                info.product_name =
                     wideToUtf8(*description);
             }
-        }
 
-        if (info.display_name.empty()) {
-            info.display_name = port_name;
-        }
+            std::string hardware_id;
 
-        if (const auto manufacturer =
-                getDevicePropertyString(
-                    device_info_set.get(),
-                    device_info,
-                    SPDRP_MFG
-                )) {
-            info.manufacturer =
-                wideToUtf8(*manufacturer);
-        }
+            if (const auto hardware_id_w =
+                    getDevicePropertyString(
+                        device_info_set.get(),
+                        device_info,
+                        SPDRP_HARDWAREID
+                    )) {
+                hardware_id =
+                    wideToUtf8(*hardware_id_w);
 
-        if (const auto description =
-                getDevicePropertyString(
-                    device_info_set.get(),
-                    device_info,
-                    SPDRP_DEVICEDESC
-                )) {
-            info.product_name =
-                wideToUtf8(*description);
-        }
-
-        std::string hardware_id;
-
-        if (const auto hardware_id_w =
-                getDevicePropertyString(
-                    device_info_set.get(),
-                    device_info,
-                    SPDRP_HARDWAREID
-                )) {
-            hardware_id =
-                wideToUtf8(*hardware_id_w);
-
-            info.vendor_id =
-                parseHex16(
-                    hardware_id,
-                    "VID_"
-                );
-
-            info.product_id =
-                parseHex16(
-                    hardware_id,
-                    "PID_"
-                );
-        }
-
-        std::string instance_id;
-
-        if (const auto instance_id_w =
-                getDeviceInstanceId(
-                    device_info_set.get(),
-                    device_info
-                )) {
-            instance_id =
-                wideToUtf8(*instance_id_w);
-
-            info.serial_number =
-                extractSerialNumber(
-                    instance_id
-                );
-
-            if (info.vendor_id == 0) {
                 info.vendor_id =
                     parseHex16(
-                        instance_id,
+                        hardware_id,
                         "VID_"
                     );
-            }
 
-            if (info.product_id == 0) {
                 info.product_id =
                     parseHex16(
-                        instance_id,
+                        hardware_id,
                         "PID_"
                     );
             }
+
+            std::string instance_id;
+
+            if (const auto instance_id_w =
+                    getDeviceInstanceId(
+                        device_info_set.get(),
+                        device_info
+                    )) {
+                instance_id =
+                    wideToUtf8(*instance_id_w);
+
+                info.serial_number =
+                    extractSerialNumber(
+                        instance_id
+                    );
+
+                if (info.vendor_id == 0) {
+                    info.vendor_id =
+                        parseHex16(
+                            instance_id,
+                            "VID_"
+                        );
+                }
+
+                if (info.product_id == 0) {
+                    info.product_id =
+                        parseHex16(
+                            instance_id,
+                            "PID_"
+                        );
+                }
+            }
+
+            constexpr std::uint16_t MMS_VENDOR_ID =
+                0x1915;
+
+            constexpr std::uint16_t MMS_PRODUCT_ID =
+                0xd978;
+
+            const bool exact_usb_match =
+                info.vendor_id == MMS_VENDOR_ID &&
+                info.product_id == MMS_PRODUCT_ID;
+
+            const std::string combined =
+                info.path + " " +
+                info.display_name + " " +
+                info.manufacturer + " " +
+                info.product_name + " " +
+                hardware_id + " " +
+                instance_id;
+
+            info.likely_mms =
+                exact_usb_match ||
+                looksLikeMmsName(combined);
+
+            ports.push_back(
+                std::move(info)
+            );
         }
+    } else {
+        const DWORD error = GetLastError();
 
-        constexpr std::uint16_t MMS_VENDOR_ID =
-            0x1915;
+        /*
+         * Wine may not provide the Windows ports device class through SetupAPI
+         * even though explicit Wine COM mappings exist. On native Windows,
+         * preserve the existing behavior and report unexpected SetupAPI errors.
+         */
+        HKEY wine_ports_key = nullptr;
 
-        constexpr std::uint16_t MMS_PRODUCT_ID =
-            0xd978;
-
-        const bool exact_usb_match =
-            info.vendor_id == MMS_VENDOR_ID &&
-            info.product_id == MMS_PRODUCT_ID;
-
-        const std::string combined =
-            info.path + " " +
-            info.display_name + " " +
-            info.manufacturer + " " +
-            info.product_name + " " +
-            hardware_id + " " +
-            instance_id;
-
-        info.likely_mms =
-            exact_usb_match ||
-            looksLikeMmsName(combined);
-
-        ports.push_back(
-            std::move(info)
+        const LONG wine_key_result = RegOpenKeyExW(
+            HKEY_LOCAL_MACHINE,
+            L"Software\\Wine\\Ports",
+            0,
+            KEY_READ,
+            &wine_ports_key
         );
+
+        if (wine_key_result == ERROR_SUCCESS) {
+            RegCloseKey(wine_ports_key);
+        } else {
+            throw std::runtime_error(
+                windowsErrorMessage(
+                    "SetupDiGetClassDevsW",
+                    error
+                )
+            );
+        }
     }
+
+    /*
+     * Wine serial mappings may not appear through SetupAPI. Add explicitly
+     * configured Wine COM ports as protocol-verification candidates.
+     *
+     * On native Windows the registry key normally does not exist, so this is
+     * effectively a no-op.
+     */
+    appendWineRegistryPorts(ports);
 
     std::sort(
         ports.begin(),

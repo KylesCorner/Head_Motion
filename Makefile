@@ -5,17 +5,18 @@
 #   make release
 #   make appimage
 #
-#   make rebuild-debug
-#   make rebuild-release
+# Windows cross-compile from Linux/Arch:
+#   make windows-cross-deps
+#   make windows-cross-debug
+#   make windows-cross-release
 #
-#   make run-gui-debug
-#   make run-gui-release
+# Wine smoke tests:
+#   make run-wine-gui
+#   make run-wine-scan
+#   make run-wine-identify WINE_PORT=COM1
 #
-#   make run-scan
-#   make run-identify PORT=/dev/ttyACM0
-#
-#   make clean
-#   make distclean
+# Native Windows builds still use the windows-debug/windows-release
+# CMake presets directly from Windows.
 
 GENERATOR ?= Ninja
 SERIAL_BACKEND ?= native
@@ -23,9 +24,12 @@ SERIAL_BACKEND ?= native
 CMAKE ?= cmake
 CTEST ?= ctest
 CPACK ?= cpack
+WINE ?= wine
 
 CONTAINER_ENGINE ?= docker
 
+VCPKG ?= ./external/vcpkg/vcpkg
+WINE_PORT ?= COM1
 
 # ============================================================
 # Build directories
@@ -39,6 +43,15 @@ RELEASE_APP := $(RELEASE_BUILD_DIR)/mmsctl
 
 DEBUG_GUI   := $(DEBUG_BUILD_DIR)/headmotion_gui
 RELEASE_GUI := $(RELEASE_BUILD_DIR)/headmotion_gui
+
+WINDOWS_CROSS_DEBUG_DIR   := build/windows-cross-debug
+WINDOWS_CROSS_RELEASE_DIR := build/windows-cross-release
+
+WINDOWS_CROSS_DEBUG_APP := $(WINDOWS_CROSS_DEBUG_DIR)/mmsctl.exe
+WINDOWS_CROSS_DEBUG_GUI := $(WINDOWS_CROSS_DEBUG_DIR)/headmotion_gui.exe
+
+WINDOWS_CROSS_RELEASE_APP := $(WINDOWS_CROSS_RELEASE_DIR)/mmsctl.exe
+WINDOWS_CROSS_RELEASE_GUI := $(WINDOWS_CROSS_RELEASE_DIR)/headmotion_gui.exe
 
 BOOKWORM_BUILDER_IMAGE := headmotion-bookworm-builder
 BOOKWORM_BUILD_DIR := build/linux-bookworm-release
@@ -54,9 +67,18 @@ DIST_DIR := dist
 	debug release appimage \
 	configure-debug configure-release \
 	rebuild-debug rebuild-release \
-	clean-debug clean-release clean distclean \
+	windows-cross-deps \
+	configure-windows-cross-debug configure-windows-cross-release \
+	windows-cross-debug windows-cross-release \
+	rebuild-windows-cross-debug rebuild-windows-cross-release \
+	clean-debug clean-release \
+	clean-windows-cross-debug clean-windows-cross-release \
+	clean-windows-cross clean distclean \
 	test-debug test-release test \
 	run-gui-debug run-gui-release \
+	run-wine-gui run-wine-scan run-wine-identify \
+	run-wine-record-start run-wine-record-stop \
+	run-wine-sync run-wine-record-reset \
 	run-scan run-identify \
 	run-record-start run-record-stop \
 	run-sync run-record-reset \
@@ -65,7 +87,7 @@ DIST_DIR := dist
 all: debug
 
 # ============================================================
-# Debug build
+# Linux Debug build
 # ============================================================
 
 configure-debug:
@@ -85,7 +107,7 @@ clean-debug:
 	fi
 
 # ============================================================
-# Release build
+# Linux Release build
 # ============================================================
 
 configure-release:
@@ -103,6 +125,67 @@ clean-release:
 	@if [ -d "$(RELEASE_BUILD_DIR)" ]; then \
 		$(CMAKE) --build $(RELEASE_BUILD_DIR) --target clean; \
 	fi
+
+# ============================================================
+# Windows cross-compile dependencies
+#
+# Requires Arch packages:
+#   mingw-w64-gcc cmake ninja wine
+#
+# Assumes vcpkg is cloned at:
+#   external/vcpkg
+# ============================================================
+
+windows-cross-deps:
+	@command -v x86_64-w64-mingw32-gcc >/dev/null 2>&1 || \
+		{ echo "Missing x86_64-w64-mingw32-gcc. Install mingw-w64-gcc."; exit 1; }
+	@command -v x86_64-w64-mingw32-g++ >/dev/null 2>&1 || \
+		{ echo "Missing x86_64-w64-mingw32-g++. Install mingw-w64-gcc."; exit 1; }
+	@command -v ninja >/dev/null 2>&1 || \
+		{ echo "Missing ninja."; exit 1; }
+	@test -f external/vcpkg/bootstrap-vcpkg.sh || \
+		{ echo "vcpkg not found at external/vcpkg"; \
+		  echo "Clone it with: git clone https://github.com/microsoft/vcpkg.git external/vcpkg"; \
+		  exit 1; }
+	@if [ ! -x "$(VCPKG)" ]; then \
+		./external/vcpkg/bootstrap-vcpkg.sh -disableMetrics; \
+	fi
+	$(VCPKG) install fltk:x64-mingw-static
+
+# ============================================================
+# Windows cross-compile: Debug
+# ============================================================
+
+configure-windows-cross-debug:
+	$(CMAKE) --preset windows-cross-debug
+
+windows-cross-debug: configure-windows-cross-debug
+	$(CMAKE) --build --preset windows-cross-debug
+
+rebuild-windows-cross-debug: clean-windows-cross-debug windows-cross-debug
+
+clean-windows-cross-debug:
+	rm -rf $(WINDOWS_CROSS_DEBUG_DIR)
+
+# ============================================================
+# Windows cross-compile: Release
+# ============================================================
+
+configure-windows-cross-release:
+	$(CMAKE) --preset windows-cross-release
+
+windows-cross-release: configure-windows-cross-release
+	$(CMAKE) --build --preset windows-cross-release
+
+rebuild-windows-cross-release: clean-windows-cross-release windows-cross-release
+
+clean-windows-cross-release:
+	rm -rf $(WINDOWS_CROSS_RELEASE_DIR)
+
+clean-windows-cross:
+	rm -rf \
+		$(WINDOWS_CROSS_DEBUG_DIR) \
+		$(WINDOWS_CROSS_RELEASE_DIR)
 
 # ============================================================
 # Packaging
@@ -170,7 +253,7 @@ appimage:
 # Cleanup
 # ============================================================
 
-clean: clean-debug clean-release
+clean: clean-debug clean-release clean-windows-cross
 
 distclean:
 	rm -rf build
@@ -192,7 +275,7 @@ test-release: release
 test: test-debug
 
 # ============================================================
-# GUI
+# Linux GUI
 # ============================================================
 
 run-gui-debug: debug
@@ -202,9 +285,49 @@ run-gui-release: release
 	./$(RELEASE_GUI)
 
 # ============================================================
-# CLI development commands
+# Wine smoke tests
 #
-# These use the Debug build by default.
+# These execute the Windows Debug cross-build.
+# WINE_PORT defaults to COM1.
+# ============================================================
+
+run-wine-gui: windows-cross-debug
+	$(WINE) $(WINDOWS_CROSS_DEBUG_GUI)
+
+run-wine-scan: windows-cross-debug
+	$(WINE) $(WINDOWS_CROSS_DEBUG_APP) scan --json
+
+run-wine-identify: windows-cross-debug
+	$(WINE) $(WINDOWS_CROSS_DEBUG_APP) identify \
+		--port $(WINE_PORT) \
+		--json
+
+run-wine-record-start: windows-cross-debug
+	$(WINE) $(WINDOWS_CROSS_DEBUG_APP) record-start \
+		--port $(WINE_PORT) \
+		--rate $(or $(RATE),50) \
+		--json
+
+run-wine-record-stop: windows-cross-debug
+	$(WINE) $(WINDOWS_CROSS_DEBUG_APP) record-stop \
+		--port $(WINE_PORT) \
+		--json
+
+run-wine-sync: windows-cross-debug
+	$(WINE) $(WINDOWS_CROSS_DEBUG_APP) sync \
+		--port $(WINE_PORT) \
+		--out $(or $(OUT),data/wine-test) \
+		--json
+
+run-wine-record-reset: windows-cross-debug
+	$(WINE) $(WINDOWS_CROSS_DEBUG_APP) record-reset \
+		--port $(WINE_PORT) \
+		--json
+
+# ============================================================
+# Linux CLI development commands
+#
+# These use the Linux Debug build by default.
 # ============================================================
 
 run-scan: debug
@@ -253,27 +376,43 @@ endif
 help:
 	@echo "HeadMotion MMS client"
 	@echo ""
-	@echo "Build targets:"
+	@echo "Linux builds:"
 	@echo "  make debug"
-	@echo "      Build Debug configuration"
-	@echo ""
 	@echo "  make release"
-	@echo "      Build Release configuration"
-	@echo ""
 	@echo "  make rebuild-debug"
 	@echo "  make rebuild-release"
 	@echo ""
+	@echo "Windows cross-compile from Linux:"
+	@echo "  make windows-cross-deps"
+	@echo "      Verify MinGW/vcpkg and install fltk:x64-mingw-static"
+	@echo ""
+	@echo "  make windows-cross-debug"
+	@echo "  make windows-cross-release"
+	@echo "  make rebuild-windows-cross-debug"
+	@echo "  make rebuild-windows-cross-release"
+	@echo ""
+	@echo "Wine:"
+	@echo "  make run-wine-gui"
+	@echo "  make run-wine-scan"
+	@echo "  make run-wine-identify WINE_PORT=COM1"
+	@echo "  make run-wine-record-start WINE_PORT=COM1 RATE=200"
+	@echo "  make run-wine-record-stop WINE_PORT=COM1"
+	@echo "  make run-wine-sync WINE_PORT=COM1 OUT=data/wine-test"
+	@echo "  make run-wine-record-reset WINE_PORT=COM1"
+	@echo ""
 	@echo "Packaging:"
 	@echo "  make appimage"
-	@echo "      Build Release and create the Linux AppImage"
 	@echo ""
 	@echo "Cleanup:"
 	@echo "  make clean-debug"
 	@echo "  make clean-release"
+	@echo "  make clean-windows-cross-debug"
+	@echo "  make clean-windows-cross-release"
+	@echo "  make clean-windows-cross"
 	@echo "  make clean"
 	@echo "  make distclean"
 	@echo ""
-	@echo "GUI:"
+	@echo "Linux GUI:"
 	@echo "  make run-gui-debug"
 	@echo "  make run-gui-release"
 	@echo ""
@@ -281,7 +420,7 @@ help:
 	@echo "  make test-debug"
 	@echo "  make test-release"
 	@echo ""
-	@echo "CLI development:"
+	@echo "Linux CLI development:"
 	@echo "  make run-scan"
 	@echo "  make run-identify PORT=/dev/ttyACM0"
 	@echo "  make run-record-start PORT=/dev/ttyACM0 RATE=200"
@@ -292,3 +431,6 @@ help:
 	@echo "Variables:"
 	@echo "  SERIAL_BACKEND=native|libserialport"
 	@echo "  GENERATOR=Ninja"
+	@echo "  WINE=wine"
+	@echo "  WINE_PORT=COM1"
+	@echo "  VCPKG=./external/vcpkg/vcpkg"

@@ -12,6 +12,12 @@ project(headmotion_client
 option(HEADMOTION_BUILD_TESTS "Build unit tests" OFF)
 option(HEADMOTION_BUILD_GUI "Build FLTK GUI" ON)
 
+option(
+    HEADMOTION_STATIC_MINGW_RUNTIME
+    "Statically link the MinGW runtime into Windows executables"
+    ON
+)
+
 set(
     HEADMOTION_SERIAL_BACKEND
     "native"
@@ -50,6 +56,10 @@ endif()
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
+
+if(CMAKE_CROSSCOMPILING AND WIN32)
+    message(STATUS "Cross-compiling HeadMotion for Windows")
+endif()
 
 # ============================================================
 # Core portable utilities
@@ -393,6 +403,29 @@ if(HEADMOTION_BUILD_GUI)
     if(WIN32)
         set_target_properties(headmotion_gui PROPERTIES
             WIN32_EXECUTABLE TRUE
+        )
+    endif()
+
+endif()
+
+# ============================================================
+# MinGW runtime
+#
+# The Arch Linux -> Windows cross build uses the static vcpkg
+# triplet.  Link the MinGW runtime statically as well so the
+# resulting EXEs do not require libgcc_s_seh-1.dll,
+# libstdc++-6.dll, or libwinpthread-1.dll beside them.
+# ============================================================
+
+if(MINGW AND HEADMOTION_STATIC_MINGW_RUNTIME)
+
+    target_link_options(mmsctl PRIVATE
+        -static
+    )
+
+    if(HEADMOTION_BUILD_GUI)
+        target_link_options(headmotion_gui PRIVATE
+            -static
         )
     endif()
 

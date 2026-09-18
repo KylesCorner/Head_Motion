@@ -8,7 +8,7 @@
   "configurePresets": [
     {
       "name": "windows-debug",
-      "displayName": "Windows x64 Debug",
+      "displayName": "Windows x64 Debug (MSVC)",
       "generator": "Visual Studio 18 2026",
       "architecture": "x64",
       "toolset": "host=x64",
@@ -22,7 +22,7 @@
     },
     {
       "name": "windows-release",
-      "displayName": "Windows x64 Release",
+      "displayName": "Windows x64 Release (MSVC)",
       "generator": "Visual Studio 18 2026",
       "architecture": "x64",
       "toolset": "host=x64",
@@ -33,20 +33,67 @@
         "HEADMOTION_SERIAL_BACKEND": "native",
         "HEADMOTION_BUILD_GUI": "ON"
       }
+    },
+    {
+      "name": "windows-cross-base",
+      "displayName": "Windows x64 MinGW Cross Compile Base",
+      "hidden": true,
+      "generator": "Ninja",
+      "toolchainFile": "${sourceDir}/external/vcpkg/scripts/buildsystems/vcpkg.cmake",
+      "cacheVariables": {
+        "CMAKE_SYSTEM_NAME": "Windows",
+        "CMAKE_C_COMPILER": "x86_64-w64-mingw32-gcc",
+        "CMAKE_CXX_COMPILER": "x86_64-w64-mingw32-g++",
+        "CMAKE_FIND_ROOT_PATH_MODE_PACKAGE": "ONLY",
+        "VCPKG_TARGET_TRIPLET": "x64-mingw-static",
+        "VCPKG_HOST_TRIPLET": "x64-linux",
+        "FLTK_DIR": "${sourceDir}/external/vcpkg/installed/x64-mingw-static/share/fltk",
+        "HEADMOTION_SERIAL_BACKEND": "native",
+        "HEADMOTION_BUILD_GUI": "ON",
+        "HEADMOTION_STATIC_MINGW_RUNTIME": "ON"
+      }
+    },
+    {
+      "name": "windows-cross-debug",
+      "displayName": "Windows x64 Debug (MinGW cross compile)",
+      "inherits": "windows-cross-base",
+      "binaryDir": "${sourceDir}/build/windows-cross-debug",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug"
+      }
+    },
+    {
+      "name": "windows-cross-release",
+      "displayName": "Windows x64 Release (MinGW cross compile)",
+      "inherits": "windows-cross-base",
+      "binaryDir": "${sourceDir}/build/windows-cross-release",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release"
+      }
     }
   ],
   "buildPresets": [
     {
       "name": "windows-debug",
-      "displayName": "Build Windows x64 Debug",
+      "displayName": "Build Windows x64 Debug (MSVC)",
       "configurePreset": "windows-debug",
       "configuration": "Debug"
     },
     {
       "name": "windows-release",
-      "displayName": "Build Windows x64 Release",
+      "displayName": "Build Windows x64 Release (MSVC)",
       "configurePreset": "windows-release",
       "configuration": "Release"
+    },
+    {
+      "name": "windows-cross-debug",
+      "displayName": "Build Windows x64 Debug (MinGW cross compile)",
+      "configurePreset": "windows-cross-debug"
+    },
+    {
+      "name": "windows-cross-release",
+      "displayName": "Build Windows x64 Release (MinGW cross compile)",
+      "configurePreset": "windows-cross-release"
     }
   ]
 }
