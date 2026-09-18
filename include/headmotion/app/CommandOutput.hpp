@@ -2,6 +2,10 @@
 
 #include <cstdint>
 #include <functional>
+#include <stdexcept>
+#include <memory>
+#include <fstream>
+#include <filesystem>
 #include <initializer_list>
 #include <iostream>
 #include <mutex>
@@ -390,6 +394,87 @@ public:
                 << line
                 << '\n'
                 << std::flush;
+        };
+    }
+
+    /*
+     * Create a JSONL sink that owns its file for the lifetime of the sink.
+     *
+     * The file is opened with std::ios::trunc, so starting a new run with the
+     * same path automatically replaces the previous run's log.
+     */
+    static Sink jsonFileSink(
+        const std::filesystem::path& path
+    ) {
+        if (path.has_parent_path()) {
+            std::filesystem::create_directories(
+                path.parent_path()
+            );
+        }
+
+        auto file =
+            std::make_shared<std::ofstream>(
+                path,
+                std::ios::out |
+                std::ios::trunc
+            );
+
+        if (!*file) {
+            throw std::runtime_error(
+                "Failed to open JSONL log file: " +
+                path.string()
+            );
+        }
+
+        auto mutex =
+            std::make_shared<std::mutex>();
+
+        return [
+            file = std::move(file),
+            mutex = std::move(mutex)
+        ](
+            const CommandEvent& event
+        ) {
+            const std::string line =
+                toJsonLine(event);
+
+            std::lock_guard<std::mutex> lock(
+                *mutex
+            );
+
+            *file
+                << line
+                << '\n';
+
+            file->flush();
+
+            if (!*file) {
+                throw std::runtime_error(
+                    "Failed while writing JSONL command log"
+                );
+            }
+        };
+    }
+
+    /*
+     * Fan one CommandEvent out to multiple destinations.
+     *
+     * The GUI uses this to send each event both to its in-memory device state
+     * and to a JSONL file without serializing/parsing JSON in between.
+     */
+    static Sink combineSinks(
+        std::vector<Sink> sinks
+    ) {
+        return [
+            sinks = std::move(sinks)
+        ](
+            const CommandEvent& event
+        ) mutable {
+            for (auto& sink : sinks) {
+                if (sink) {
+                    sink(event);
+                }
+            }
         };
     }
 

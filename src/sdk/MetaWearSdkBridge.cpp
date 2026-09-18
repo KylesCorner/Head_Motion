@@ -80,7 +80,7 @@ bool MetaWearSdkBridge::initialize(int timeout_ms) {
     initialized_ = false;
     initialize_status_ = -999;
 
-    std::cout << "SDK: initializing board\n";
+    // std::cout << "SDK: initializing board\n";
 
     mbl_mw_metawearboard_initialize(
         board_,
@@ -327,9 +327,9 @@ void MetaWearSdkBridge::handleReadGattChar(
 
     const auto bytes = stringBytes(selected);
 
-    std::cout << "SDK read_gatt_char fallback response: \""
-              << selected
-              << "\"\n";
+    // std::cout << "SDK read_gatt_char fallback response: \""
+    //           << selected
+    //           << "\"\n";
 
     if (handler != nullptr) {
         handler(caller, bytes.data(), static_cast<std::uint8_t>(bytes.size()));
@@ -347,7 +347,7 @@ void MetaWearSdkBridge::handleEnableNotifications(
     notify_caller_ = caller;
     notify_handler_ = handler;
 
-    std::cout << "SDK enable_notifications registered\n";
+    // std::cout << "SDK enable_notifications registered\n";
 
     if (ready != nullptr) {
         ready(caller, 0);
@@ -361,7 +361,7 @@ void MetaWearSdkBridge::handleDisconnectSubscribe(
     (void)caller;
     (void)handler;
 
-    std::cout << "SDK on_disconnect registered\n";
+    // std::cout << "SDK on_disconnect registered\n";
 }
 
 void MetaWearSdkBridge::feedNotificationPayload(
@@ -619,7 +619,7 @@ void MetaWearSdkBridge::initializedThunk(
     self->initialize_status_ = status;
     self->initialized_ = true;
 
-    std::cout << "SDK initialized callback status=" << status << "\n";
+    // std::cout << "SDK initialized callback status=" << status << "\n";
 }
 
 bool MetaWearSdkBridge::discoverAnonymousSignals(
@@ -641,8 +641,8 @@ bool MetaWearSdkBridge::discoverAnonymousSignals(
     anonymous_discovery_done_ = false;
     anonymous_discovery_status_ = -999;
 
-    std::cout
-        << "SDK: discovering anonymous logger signals\n";
+    // std::cout
+        // << "SDK: discovering anonymous logger signals\n";
 
     mbl_mw_metawearboard_create_anonymous_datasignals(
         board_,

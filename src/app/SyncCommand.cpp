@@ -23,6 +23,7 @@
 
 #include "headmotion/app/Commands.hpp"
 #include "headmotion/app/CommandOutput.hpp"
+#include "headmotion/app/MmsDeviceProbe.hpp"
 #include "headmotion/metawear/MetaWearUsbTransport.hpp"
 #include "headmotion/sdk/MetaWearSdkBridge.hpp"
 #include "headmotion/transport/SerialConfig.hpp"
@@ -38,6 +39,7 @@ extern "C" {
 
 #include <atomic>
 #include <chrono>
+#include <cctype>
 #include <condition_variable>
 #include <cstdint>
 #include <deque>
@@ -167,9 +169,159 @@ struct CsvOutputPaths {
     std::filesystem::path battery;
 };
 
-CsvOutputPaths chooseUnusedCsvOutputPaths(
-    const std::filesystem::path& output_dir
+std::string sanitizeFilenameToken(
+    std::string value
 ) {
+    for (char& ch : value) {
+        const unsigned char uch =
+            static_cast<unsigned char>(ch);
+
+        if (
+            !std::isalnum(uch) &&
+            ch != '-' &&
+            ch != '_'
+        ) {
+            ch = '_';
+        }
+    }
+
+    while (
+        !value.empty() &&
+        value.front() == '_'
+    ) {
+        value.erase(value.begin());
+    }
+
+    while (
+        !value.empty() &&
+        value.back() == '_'
+    ) {
+        value.pop_back();
+    }
+
+    return value;
+}
+
+std::string deviceIdFromPortMetadata(
+    const std::string& port_name
+) {
+    const auto ports =
+        headmotion::transport::SerialPortFactory::
+            listPorts();
+
+    for (const auto& port : ports) {
+        if (
+            port_name != port.path &&
+            port_name != port.symlink_path &&
+            port_name != port.preferredPath()
+        ) {
+            continue;
+        }
+
+        if (!port.serial_number.empty()) {
+            return sanitizeFilenameToken(
+                port.serial_number
+            );
+        }
+
+        if (!port.symlink_path.empty()) {
+            constexpr const char* marker =
+                "usb-MbientLab_MetaMotionS_";
+
+            const std::size_t begin =
+                port.symlink_path.find(marker);
+
+            if (begin != std::string::npos) {
+                const std::size_t serial_begin =
+                    begin + std::string(marker).size();
+
+                const std::size_t serial_end =
+                    port.symlink_path.find(
+                        "-if",
+                        serial_begin
+                    );
+
+                if (
+                    serial_end != std::string::npos &&
+                    serial_end > serial_begin
+                ) {
+                    return sanitizeFilenameToken(
+                        port.symlink_path.substr(
+                            serial_begin,
+                            serial_end - serial_begin
+                        )
+                    );
+                }
+            }
+        }
+    }
+
+    return {};
+}
+
+std::string resolveOutputDeviceId(
+    const std::string& port_name,
+    CommandOutput& output
+) {
+    std::string device_id =
+        deviceIdFromPortMetadata(
+            port_name
+        );
+
+    if (!device_id.empty()) {
+        return device_id;
+    }
+
+    const auto probe =
+        probeMmsDevice(
+            port_name
+        );
+
+    if (probe) {
+        device_id =
+            sanitizeFilenameToken(
+                deviceIdFromMmsIdentity(
+                    probe->identity
+                )
+            );
+
+        if (!device_id.empty()) {
+            return device_id;
+        }
+    }
+
+    const std::filesystem::path port_path{
+        port_name
+    };
+
+    device_id =
+        sanitizeFilenameToken(
+            port_path.filename().string()
+        );
+
+    if (device_id.empty()) {
+        device_id = "unknown_device";
+    }
+
+    output.warning(
+        "device_id_fallback",
+        "Could not resolve the MMS+ hardware ID; "
+        "using port-derived filename token " +
+        device_id
+    );
+
+    return device_id;
+}
+
+CsvOutputPaths chooseUnusedCsvOutputPaths(
+    const std::filesystem::path& output_dir,
+    const std::string& device_id
+) {
+    const std::string safe_device_id =
+        sanitizeFilenameToken(
+            device_id
+        );
+
     for (std::uint64_t index = 0; ; ++index) {
         const std::string suffix =
             index == 0
@@ -177,14 +329,33 @@ CsvOutputPaths chooseUnusedCsvOutputPaths(
             : "_" + std::to_string(index);
 
         CsvOutputPaths candidate{
-            output_dir / ("imu" + suffix + ".csv"),
-            output_dir / ("imu_xsens" + suffix + ".csv"),
-            output_dir / ("battery" + suffix + ".csv")
+            output_dir /
+                (
+                    "imu_legacy_" +
+                    safe_device_id +
+                    suffix +
+                    ".csv"
+                ),
+            output_dir /
+                (
+                    "imu_" +
+                    safe_device_id +
+                    suffix +
+                    ".csv"
+                ),
+            output_dir /
+                (
+                    "battery_" +
+                    safe_device_id +
+                    suffix +
+                    ".csv"
+                )
         };
 
         /*
-         * Reserve the same suffix for the whole session even when imu.csv is not
-         * requested.  This keeps related output names aligned.
+         * Reserve the same suffix for this device/session.  Different MMS+
+         * devices have different base names, so parallel sync operations do
+         * not race on the same CSV path.
          */
         if (
             !std::filesystem::exists(candidate.imu) &&
@@ -1618,6 +1789,20 @@ int runSyncCommand(
 
     output.status("preparing_output");
 
+    const std::string output_device_id =
+        resolveOutputDeviceId(
+            port_name,
+            output
+        );
+
+    output.event(
+        "device",
+        {
+            {"device_id", output_device_id},
+            {"port", port_name}
+        }
+    );
+
     const std::filesystem::path output_dir{
         output_path
     };
@@ -1628,7 +1813,8 @@ int runSyncCommand(
 
     const CsvOutputPaths csv_paths =
         chooseUnusedCsvOutputPaths(
-            output_dir
+            output_dir,
+            output_device_id
         );
 
     const auto& imu_path =
