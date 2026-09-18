@@ -2,18 +2,27 @@
  * Developer Notes: SyncCommand
  * ----------------------------
  *
- * SyncCommand drains MetaWear onboard flash logs over the project's USB-backed
- * SDK bridge and writes decoded records to disk.
+ * Stateless MMS+ log download path.
  *
- * The sync path is intentionally stateless.  It performs a fresh SDK
- * initialization, asks the MMS+ which logger routes currently exist, subscribes
- * to those routes as anonymous data signals, and downloads the onboard flash.
+ * Performance design:
+ *   - MetaWear SDK callbacks never format CSV rows or timestamps.
+ *   - Callbacks only validate/copy decoded samples into a bounded queue.
+ *   - A dedicated writer thread drains the queue, pairs accel/gyro samples,
+ *     and writes the Xsens-compatible CSV.
+ *   - The legacy long-format imu.csv is disabled by default and can be enabled
+ *     by the CLI through the write_imu_csv overload of runSyncCommand.
+ *   - UTC timestamps are generated only on the CSV writer thread, never in
+ *     the SDK callback path.  Temporary accel/gyro pairing files are gone.
  *
- * No serialized board state, saved logger IDs, or per-device host metadata are
- * required.
+ * Stateless behavior is preserved:
+ *   - A fresh SDK board is initialized for every sync.
+ *   - Logger routes are reconstructed from anonymous data signals on the MMS+.
+ *   - No serialized board state, saved logger IDs, or per-device host metadata
+ *     are required.
  */
 
 #include "headmotion/app/Commands.hpp"
+#include "headmotion/app/CommandOutput.hpp"
 #include "headmotion/metawear/MetaWearUsbTransport.hpp"
 #include "headmotion/sdk/MetaWearSdkBridge.hpp"
 #include "headmotion/transport/SerialConfig.hpp"
@@ -22,1858 +31,2011 @@
 extern "C" {
 #include "metawear/core/anonymous_datasignal.h"
 #include "metawear/core/data.h"
-#include "metawear/core/metawearboard.h"
 #include "metawear/core/logging.h"
+#include "metawear/core/metawearboard.h"
 #include "metawear/core/types.h"
 }
 
 #include <atomic>
-#include <iomanip>
 #include <chrono>
+#include <condition_variable>
 #include <cstdint>
-#include <cstring>
-#include <ctime>
+#include <deque>
 #include <filesystem>
 #include <fstream>
+#include <iomanip>
 #include <iostream>
 #include <mutex>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <thread>
-#include <optional>
+#include <ctime>
 #include <sstream>
 #include <utility>
 #include <vector>
 
 namespace headmotion::app {
 
-    namespace {
-
-        /*
-         * During battery/debug runs, clearing after a successful sync prevents old log
-         * entries from being downloaded again and mixed into the next CSV.
-         *
-         * Set this to false if you want sync to be non-destructive.
-         */
-        constexpr bool CLEAR_AFTER_SUCCESSFUL_SYNC = false;
-
-        struct TimedVectorSample {
-            std::int64_t epoch_ms = 0;
-            float x = 0.0f;
-            float y = 0.0f;
-            float z = 0.0f;
-        };
-
-        struct SyncState {
-            std::ofstream imu_csv;
-            std::ofstream xsens_csv;
-            std::ofstream battery_csv;
-            std::ofstream xsens_accel_temp;
-            std::ofstream xsens_gyro_temp;
-            std::mutex csv_mutex;
-
-            headmotion::app::SyncProgressCallback
-                progress_callback;
-
-            /*
-             * Absolute timestamps come directly from MblMwData::epoch.
-             * Elapsed time is relative to the first sample observed in this sync.
-             */
-            std::optional<std::int64_t> first_sdk_epoch_ms;
-
-            /*
-             * Anonymous logger discovery state.  Keep it here so the callback context
-             * remains valid for the entire lifetime of runSyncCommand.
-             */
-            std::atomic<bool> anonymous_discovery_done{ false };
-            std::atomic<std::int32_t> anonymous_discovery_status{ -999 };
-            std::vector<MblMwAnonymousDataSignal*> anonymous_signals;
-
-            std::atomic<bool> download_started{ false };
-            std::atomic<bool> download_done{ false };
-
-            std::atomic<std::uint32_t> entries_left{ 0 };
-            std::atomic<std::uint32_t> total_entries{ 0 };
-
-            std::atomic<std::uint64_t> imu_rows_written{ 0 };
-            std::atomic<std::uint64_t> xsens_rows_written{ 0 };
-            std::atomic<std::uint64_t> battery_rows_written{ 0 };
-            std::uint64_t xsens_packet_counter = 0;
-            std::uint64_t xsens_unmatched_accel = 0;
-            std::uint64_t xsens_unmatched_gyro = 0;
-            std::uint32_t xsens_pair_tolerance_ms = 20;
-            std::atomic<bool> xsens_temp_write_failed{ false };
-            std::atomic<std::uint64_t> unknown_entries{ 0 };
-            std::atomic<std::uint64_t> unhandled_entries{ 0 };
-        };
-
-        struct CsvOutputPaths {
-            std::filesystem::path imu;
-            std::filesystem::path xsens;
-            std::filesystem::path battery;
-            std::filesystem::path xsens_accel_temp;
-            std::filesystem::path xsens_gyro_temp;
-        };
-
-        CsvOutputPaths chooseUnusedCsvOutputPaths(
-            const std::filesystem::path& output_dir
-        ) {
-            for (std::uint64_t index = 0; ; ++index) {
-                const std::string suffix =
-                    index == 0
-                    ? std::string{}
-                : "_" + std::to_string(index);
-
-                CsvOutputPaths candidate{
-                    output_dir / ("imu" + suffix + ".csv"),
-                    output_dir / ("imu_xsens" + suffix + ".csv"),
-                    output_dir / ("battery" + suffix + ".csv"),
-                    output_dir / (".imu_xsens_accel" + suffix + ".bin"),
-                    output_dir / (".imu_xsens_gyro" + suffix + ".bin")
-                };
-
-                /*
-                 * Treat any related file as a collision so all outputs retain the
-                 * same session number.
-                 */
-                if (!std::filesystem::exists(candidate.imu) &&
-                    !std::filesystem::exists(candidate.xsens) &&
-                    !std::filesystem::exists(candidate.battery) &&
-                    !std::filesystem::exists(candidate.xsens_accel_temp) &&
-                    !std::filesystem::exists(candidate.xsens_gyro_temp)) {
-                    return candidate;
-                }
-            }
-        }
-        bool openCsvForAppend(
-            std::ofstream& stream,
-            const std::filesystem::path& path,
-            const char* header
-        ) {
-            stream.open(
-                path,
-                std::ios::out |
-                std::ios::binary |
-                std::ios::app
-            );
-
-            if (!stream.is_open()) {
-                std::cerr << "Failed to open CSV: " << path << "\n";
-                return false;
-            }
-
-            /*
-             * std::ios::app guarantees that writes go to the end of the file.
-             * Only write a header when the file is empty.
-             *
-             * Normally chooseUnusedCsvOutputPaths() gives us a new file, but this
-             * check provides an independent second safeguard.
-             */
-            std::error_code size_error;
-            const std::uintmax_t size =
-                std::filesystem::file_size(path, size_error);
-
-            if (size_error) {
-                std::cerr
-                    << "Failed to inspect CSV size: "
-                    << path
-                    << ": "
-                    << size_error.message()
-                    << "\n";
-
-                stream.close();
-                return false;
-            }
-
-            if (size == 0) {
-                stream << header;
-                stream.flush();
-
-                if (!stream) {
-                    std::cerr
-                        << "Failed to write CSV header: "
-                        << path
-                        << "\n";
-
-                    stream.close();
-                    return false;
-                }
-            }
-
-            return true;
-        }
-
-
-
-        void pumpFor(headmotion::sdk::MetaWearSdkBridge& bridge, int total_ms) {
-            const auto deadline =
-                std::chrono::steady_clock::now() + std::chrono::milliseconds(total_ms);
-
-            while (std::chrono::steady_clock::now() < deadline) {
-                bridge.pumpOnce(50);
-                std::this_thread::sleep_for(std::chrono::milliseconds(10));
-            }
-        }
-
-        float readFloatLe(const std::uint8_t* bytes) {
-            float value = 0.0f;
-            std::memcpy(&value, bytes, sizeof(float));
-            return value;
-        }
-        const char* dataTypeName(MblMwDataTypeId type_id) {
-            switch (type_id) {
-            case MBL_MW_DT_ID_UINT32:
-                return "UINT32";
-            case MBL_MW_DT_ID_FLOAT:
-                return "FLOAT";
-            case MBL_MW_DT_ID_CARTESIAN_FLOAT:
-                return "CARTESIAN_FLOAT";
-            case MBL_MW_DT_ID_INT32:
-                return "INT32";
-            case MBL_MW_DT_ID_BYTE_ARRAY:
-                return "BYTE_ARRAY";
-            case MBL_MW_DT_ID_BATTERY_STATE:
-                return "BATTERY_STATE";
-            default:
-                return "UNKNOWN";
-            }
-        }
-
-        void printUnexpectedData(
-            const char* stream_name,
-            const MblMwData* data,
-            const char* reason
-        ) {
-            if (data == nullptr) {
-                std::cerr << stream_name << ": null MblMwData: " << reason << "\n";
-                return;
-            }
-
-            std::cerr
-                << stream_name
-                << ": skipping unexpected data: "
-                << reason
-                << ", epoch="
-                << data->epoch
-                << ", type="
-                << static_cast<int>(data->type_id)
-                << " ("
-                << dataTypeName(data->type_id)
-                << ")"
-                << ", length="
-                << static_cast<int>(data->length)
-                << ", value="
-                << data->value
-                << "\n";
-        }
-        struct RowTimestamp {
-            std::int64_t epoch_ms = 0;
-            std::int64_t elapsed_ms = 0;
-            std::string utc_timestamp = "";
-        };
-
-        RowTimestamp resolveRowTimestampLocked(
-            SyncState& state,
-            std::int64_t sdk_epoch_ms
-        ) {
-            RowTimestamp timestamp;
-            timestamp.epoch_ms = sdk_epoch_ms;
-
-            if (!state.first_sdk_epoch_ms.has_value()) {
-                state.first_sdk_epoch_ms = sdk_epoch_ms;
-            }
-
-            timestamp.elapsed_ms =
-                sdk_epoch_ms -
-                *state.first_sdk_epoch_ms;
-
-            /*
-             * MblMwData::epoch is Unix epoch milliseconds.  Format the same value as
-             * an explicit ISO-8601 UTC timestamp.  Use the thread-safe platform API on
-             * Windows because this client is also built and run there.
-             */
-            std::int64_t seconds = sdk_epoch_ms / 1000;
-            std::int64_t milliseconds = sdk_epoch_ms % 1000;
-
-            if (milliseconds < 0) {
-                milliseconds += 1000;
-                --seconds;
-            }
-
-            const std::time_t time_value =
-                static_cast<std::time_t>(seconds);
-
-            std::tm utc_tm{};
-
-#ifdef _WIN32
-            if (gmtime_s(&utc_tm, &time_value) != 0) {
-                timestamp.utc_timestamp = "INVALID_UTC";
-                return timestamp;
-            }
-#else
-            if (gmtime_r(&time_value, &utc_tm) == nullptr) {
-                timestamp.utc_timestamp = "INVALID_UTC";
-                return timestamp;
-            }
-#endif
-
-            std::ostringstream formatted;
-            formatted
-                << std::put_time(
-                    &utc_tm,
-                    "%Y-%m-%dT%H:%M:%S"
-                )
-                << "."
-                << std::setw(3)
-                << std::setfill('0')
-                << milliseconds
-                << "Z";
-
-            timestamp.utc_timestamp =
-                formatted.str();
-
-            return timestamp;
-        }
-
-        void writeImuDataRow(
-            SyncState* state,
-            const char* sensor,
-            const MblMwData* data
-        ) {
-            if (state == nullptr) {
-                return;
-            }
-
-            if (data == nullptr) {
-                printUnexpectedData(
-                    sensor,
-                    data,
-                    "data is null"
-                );
-
-                return;
-            }
-
-            if (data->value == nullptr) {
-                printUnexpectedData(
-                    sensor,
-                    data,
-                    "data->value is null"
-                );
-
-                return;
-            }
-
-            if (data->type_id !=
-                MBL_MW_DT_ID_CARTESIAN_FLOAT) {
-                printUnexpectedData(
-                    sensor,
-                    data,
-                    "expected CARTESIAN_FLOAT"
-                );
-
-                return;
-            }
-
-            if (data->length <
-                sizeof(MblMwCartesianFloat)) {
-                printUnexpectedData(
-                    sensor,
-                    data,
-                    "value is shorter than MblMwCartesianFloat"
-                );
-
-                return;
-            }
-
-            const auto* value =
-                static_cast<const MblMwCartesianFloat*>(
-                    data->value
-                    );
-
-            std::lock_guard<std::mutex> lock(
-                state->csv_mutex
-            );
-
-            if (!state->imu_csv.is_open()) {
-                printUnexpectedData(
-                    sensor,
-                    data,
-                    "imu_csv is not open"
-                );
-
-                return;
-            }
-
-            const RowTimestamp timestamp =
-                resolveRowTimestampLocked(
-                    *state,
-                    data->epoch
-                );
-
-            state->imu_csv
-                << timestamp.epoch_ms
-                << ","
-                << timestamp.elapsed_ms
-                << ","
-                << timestamp.utc_timestamp
-                << ","
-                << sensor
-                << ","
-                << value->x
-                << ","
-                << value->y
-                << ","
-                << value->z
-                << "\n";
-
-            if (!state->imu_csv) {
-                std::cerr
-                    << "Failed to write IMU CSV row\n";
-
-                return;
-            }
-
-            TimedVectorSample sample;
-            sample.epoch_ms = timestamp.epoch_ms;
-            sample.x = value->x;
-            sample.y = value->y;
-            sample.z = value->z;
-
-            std::ofstream* temp_stream = nullptr;
-
-            if (std::strcmp(sensor, "accel_g") == 0) {
-                temp_stream = &state->xsens_accel_temp;
-            }
-            else if (std::strcmp(sensor, "gyro_dps") == 0) {
-                temp_stream = &state->xsens_gyro_temp;
-            }
-
-            if (temp_stream != nullptr) {
-                temp_stream->write(
-                    reinterpret_cast<const char*>(&sample),
-                    sizeof(sample)
-                );
-
-                if (!*temp_stream) {
-                    state->xsens_temp_write_failed = true;
-                    std::cerr
-                        << "Failed to write temporary Xsens pairing data for "
-                        << sensor
-                        << "\n";
-                }
-            }
-
-            state->imu_rows_written++;
-        }
-
-        bool readTimedVectorSample(
-            std::ifstream& stream,
-            TimedVectorSample& sample
-        ) {
-            stream.read(
-                reinterpret_cast<char*>(&sample),
-                sizeof(sample)
-            );
-
-            if (stream.gcount() == 0 && stream.eof()) {
-                return false;
-            }
-
-            if (stream.gcount() != static_cast<std::streamsize>(sizeof(sample))) {
-                throw std::runtime_error(
-                    "Truncated temporary Xsens pairing file"
-                );
-            }
-
-            return true;
-        }
-
-        std::uint64_t timestampDifferenceMs(
-            std::int64_t lhs,
-            std::int64_t rhs
-        ) {
-            return lhs >= rhs
-                ? static_cast<std::uint64_t>(lhs - rhs)
-                : static_cast<std::uint64_t>(rhs - lhs);
-        }
-
-        bool writeXsensWideRow(
-            SyncState& state,
-            const TimedVectorSample& accel,
-            const TimedVectorSample& gyro
-        ) {
-            const RowTimestamp timestamp =
-                resolveRowTimestampLocked(
-                    state,
-                    gyro.epoch_ms
-                );
-
-            state.xsens_csv
-                << state.xsens_packet_counter++
-                << ","
-                << timestamp.epoch_ms
-                << ",0,0,0,"
-                << accel.x
-                << ","
-                << accel.y
-                << ","
-                << accel.z
-                << ","
-                << gyro.x
-                << ","
-                << gyro.y
-                << ","
-                << gyro.z
-                << ","
-                << timestamp.elapsed_ms
-                << ","
-                << timestamp.utc_timestamp
-                << "\n";
-
-            if (!state.xsens_csv) {
-                std::cerr
-                    << "Failed to write Xsens-compatible CSV row\n";
-                return false;
-            }
-
-            state.xsens_rows_written++;
-            return true;
-        }
-
-        bool finalizeXsensCsv(
-            SyncState& state,
-            const CsvOutputPaths& paths
-        ) {
-            {
-                std::lock_guard<std::mutex> lock(state.csv_mutex);
-
-                state.xsens_accel_temp.flush();
-                state.xsens_accel_temp.close();
-                state.xsens_gyro_temp.flush();
-                state.xsens_gyro_temp.close();
-
-                if (state.xsens_temp_write_failed.load()) {
-                    std::cerr
-                        << "Cannot build Xsens-compatible CSV because temporary "
-                        << "IMU pairing data could not be written.\n";
-                    return false;
-                }
-            }
-
-            std::ifstream accel_in(
-                paths.xsens_accel_temp,
-                std::ios::in | std::ios::binary
-            );
-            std::ifstream gyro_in(
-                paths.xsens_gyro_temp,
-                std::ios::in | std::ios::binary
-            );
-
-            if (!accel_in || !gyro_in) {
-                std::cerr
-                    << "Failed to open temporary IMU pairing files\n";
-                return false;
-            }
-
-            TimedVectorSample accel;
-            TimedVectorSample gyro;
-
-            bool have_accel = readTimedVectorSample(accel_in, accel);
-            bool have_gyro = readTimedVectorSample(gyro_in, gyro);
-
-            while (have_accel && have_gyro) {
-                const std::uint64_t difference_ms =
-                    timestampDifferenceMs(
-                        accel.epoch_ms,
-                        gyro.epoch_ms
-                    );
-
-                if (difference_ms <= state.xsens_pair_tolerance_ms) {
-                    if (!writeXsensWideRow(state, accel, gyro)) {
-                        return false;
-                    }
-
-                    have_accel = readTimedVectorSample(accel_in, accel);
-                    have_gyro = readTimedVectorSample(gyro_in, gyro);
-                    continue;
-                }
-
-                if (accel.epoch_ms < gyro.epoch_ms) {
-                    state.xsens_unmatched_accel++;
-                    have_accel = readTimedVectorSample(accel_in, accel);
-                }
-                else {
-                    state.xsens_unmatched_gyro++;
-                    have_gyro = readTimedVectorSample(gyro_in, gyro);
-                }
-            }
-
-            while (have_accel) {
-                state.xsens_unmatched_accel++;
-                have_accel = readTimedVectorSample(accel_in, accel);
-            }
-
-            while (have_gyro) {
-                state.xsens_unmatched_gyro++;
-                have_gyro = readTimedVectorSample(gyro_in, gyro);
-            }
-
-            accel_in.close();
-            gyro_in.close();
-
-            std::error_code remove_error;
-            std::filesystem::remove(paths.xsens_accel_temp, remove_error);
-
-            if (remove_error) {
-                std::cerr
-                    << "WARNING: failed to remove temporary file "
-                    << paths.xsens_accel_temp
-                    << ": "
-                    << remove_error.message()
-                    << "\n";
-            }
-
-            remove_error.clear();
-            std::filesystem::remove(paths.xsens_gyro_temp, remove_error);
-
-            if (remove_error) {
-                std::cerr
-                    << "WARNING: failed to remove temporary file "
-                    << paths.xsens_gyro_temp
-                    << ": "
-                    << remove_error.message()
-                    << "\n";
-            }
-
-            return true;
-        }
-
-        void writeBatteryDataRow(
-            SyncState* state,
-            const MblMwData* data
-        ) {
-            if (state == nullptr) {
-                return;
-            }
-
-            if (data == nullptr) {
-                printUnexpectedData(
-                    "battery",
-                    data,
-                    "data is null"
-                );
-
-                return;
-            }
-
-            if (data->value == nullptr) {
-                printUnexpectedData(
-                    "battery",
-                    data,
-                    "data->value is null"
-                );
-
-                return;
-            }
-
-            if (data->type_id !=
-                MBL_MW_DT_ID_BATTERY_STATE) {
-                printUnexpectedData(
-                    "battery",
-                    data,
-                    "expected BATTERY_STATE"
-                );
-
-                return;
-            }
-
-            const auto* battery =
-                static_cast<const MblMwBatteryState*>(
-                    data->value
-                    );
-
-            std::lock_guard<std::mutex> lock(
-                state->csv_mutex
-            );
-
-            if (!state->battery_csv.is_open()) {
-                printUnexpectedData(
-                    "battery",
-                    data,
-                    "battery_csv is not open"
-                );
-
-                return;
-            }
-
-            const RowTimestamp timestamp =
-                resolveRowTimestampLocked(
-                    *state,
-                    data->epoch
-                );
-
-            state->battery_csv
-                << timestamp.epoch_ms
-                << ","
-                << timestamp.elapsed_ms
-                << ","
-                << timestamp.utc_timestamp
-                << ","
-                << battery->voltage
-                << ","
-                << static_cast<int>(battery->charge)
-                << "\n";
-
-            if (!state->battery_csv) {
-                std::cerr
-                    << "Failed to write battery CSV row\n";
-
-                return;
-            }
-
-            state->battery_rows_written++;
-        }
-
-        // void writeBatteryDataRow(
-        //     SyncState* state,
-        //     const MblMwData* data
-        // ) {
-        //     if (state == nullptr) {
-        //         return;
-        //     }
-
-        //     if (data == nullptr) {
-        //         printUnexpectedData("battery", data, "data is null");
-        //         return;
-        //     }
-
-        //     if (data->value == nullptr) {
-        //         printUnexpectedData("battery", data, "data->value is null");
-        //         return;
-        //     }
-
-        //     if (data->type_id != MBL_MW_DT_ID_BATTERY_STATE) {
-        //         printUnexpectedData("battery", data, "expected BATTERY_STATE");
-        //         return;
-        //     }
-
-        //     if (!state->battery_csv.is_open()) {
-        //         printUnexpectedData("battery", data, "battery_csv is not open");
-        //         return;
-        //     }
-
-        //     const auto* battery =
-        //         static_cast<const MblMwBatteryState*>(data->value);
-
-        //     std::lock_guard<std::mutex> lock(state->csv_mutex);
-
-        //     state->battery_csv
-        //         << data->epoch << ","
-        //         << battery->voltage << ","
-        //         << static_cast<int>(battery->charge)
-        //         << "\n";
-
-        //     state->battery_rows_written++;
-        // }
-
-        void markDownloadStarted(SyncState* state) {
-            if (state != nullptr) {
-                state->download_started = true;
-            }
-        }
-
-        void onAccelLoggerData(void* context, const MblMwData* data) {
-            auto* state = static_cast<SyncState*>(context);
-            markDownloadStarted(state);
-            writeImuDataRow(state, "accel_g", data);
-        }
-
-        void onGyroLoggerData(void* context, const MblMwData* data) {
-            auto* state = static_cast<SyncState*>(context);
-            markDownloadStarted(state);
-            writeImuDataRow(state, "gyro_dps", data);
-        }
-
-        void onBatteryLoggerData(void* context, const MblMwData* data) {
-            auto* state = static_cast<SyncState*>(context);
-            markDownloadStarted(state);
-            writeBatteryDataRow(state, data);
-        }
-        // void onAccelLoggerData(void* context, const MblMwData* data) {
-        //     writeImuDataRow(static_cast<SyncState*>(context), "accel_g", data);
-        // }
-
-        // void onGyroLoggerData(void* context, const MblMwData* data) {
-        //     writeImuDataRow(static_cast<SyncState*>(context), "gyro_dps", data);
-        // }
-
-        // void onBatteryLoggerData(void* context, const MblMwData* data) {
-        //     writeBatteryDataRow(static_cast<SyncState*>(context), data);
-        // }
-
-        // void onProgressUpdate(
-        //     void* context,
-        //     std::uint32_t entries_left,
-        //     std::uint32_t total_entries
-        // ) {
-        //     auto* state = static_cast<SyncState*>(context);
-
-        //     if (state == nullptr) {
-        //         return;
-        //     }
-
-        //     // std::cerr
-        //     // << "\n[progress callback] entries_left="
-        //     // << entries_left
-        //     // << ", total_entries="
-        //     // << total_entries
-        //     // << "\n";
-
-        //     state->download_started = true;
-        //     state->entries_left = entries_left;
-        //     state->total_entries = total_entries;
-
-        //     if (entries_left == 0) {
-        //         state->download_done = true;
-        //     }
-        // }
-
-        void onProgressUpdate(
-            void* context,
-            std::uint32_t entries_left,
-            std::uint32_t total_entries
-        ) {
-            auto* state =
-                static_cast<SyncState*>(context);
-
-            if (state == nullptr) {
-                return;
-            }
-
-            state->download_started = true;
-            state->entries_left = entries_left;
-            state->total_entries = total_entries;
-
-            if (state->progress_callback) {
-                try {
-                    state->progress_callback(
-                        entries_left,
-                        total_entries
-                    );
-                }
-                catch (...) {
-                    /*
-                     * Never allow a UI callback exception to
-                     * unwind through the MetaWear C callback.
-                     */
-                }
-            }
-
-            if (entries_left == 0) {
-                state->download_done = true;
-            }
-        }
-
-        void onUnknownEntry(
-            void* context,
-            std::uint8_t id,
-            std::int64_t epoch,
-            const std::uint8_t* data,
-            std::uint8_t length
-        ) {
-            (void)id;
-            (void)epoch;
-            (void)data;
-            (void)length;
-
-            auto* state = static_cast<SyncState*>(context);
-
-            if (state != nullptr) {
-                state->unknown_entries++;
-            }
-        }
-
-        void onUnhandledEntry(void* context, const MblMwData* data) {
-            (void)data;
-
-            auto* state = static_cast<SyncState*>(context);
-
-            if (state != nullptr) {
-                state->unhandled_entries++;
-            }
-        }
-
-        void closeCsvs(SyncState& state, bool battery_enabled) {
-            std::lock_guard<std::mutex> lock(state.csv_mutex);
-            if (state.imu_csv.is_open()) {
-                state.imu_csv.flush();
-                state.imu_csv.close();
-            }
-
-            if (state.xsens_csv.is_open()) {
-                state.xsens_csv.flush();
-                state.xsens_csv.close();
-            }
-
-            if (state.xsens_accel_temp.is_open()) {
-                state.xsens_accel_temp.flush();
-                state.xsens_accel_temp.close();
-            }
-
-            if (state.xsens_gyro_temp.is_open()) {
-                state.xsens_gyro_temp.flush();
-                state.xsens_gyro_temp.close();
-            }
-
-            if (battery_enabled && state.battery_csv.is_open()) {
-                state.battery_csv.flush();
-                state.battery_csv.close();
-            }
-        }
-
-        std::uint64_t totalRowsWritten(const SyncState& state) {
-            return state.imu_rows_written.load() +
-                state.battery_rows_written.load();
-        }
-
-        void onAnonymousSignalsCreated(
-            void* context,
-            MblMwMetaWearBoard* board,
-            MblMwAnonymousDataSignal** signals,
-            std::uint32_t size
-        ) {
-            (void)board;
-
-            auto* state =
-                static_cast<SyncState*>(context);
-
-            if (state == nullptr) {
-                return;
-            }
-
-            state->anonymous_signals.clear();
-
-            /*
-             * The SDK reports discovery failures with signals == nullptr and places the
-             * status value in the size argument.  An empty board can also produce
-             * nullptr with size == 0, which is a successful discovery of zero loggers.
-             */
-            if (signals == nullptr) {
-                state->anonymous_discovery_status =
-                    size == 0
-                    ? 0
-                    : static_cast<std::int32_t>(size);
-
-                state->anonymous_discovery_done = true;
-                return;
-            }
-
-            try {
-                state->anonymous_signals.assign(
-                    signals,
-                    signals + size
-                );
-                state->anonymous_discovery_status = 0;
-            }
-            catch (...) {
-                /*
-                 * Never unwind a C++ exception through the MetaWear C callback.
-                 */
-                state->anonymous_signals.clear();
-                state->anonymous_discovery_status = -2;
-            }
-
-            state->anonymous_discovery_done = true;
-        }
-
-        bool discoverAnonymousSignals(
-            headmotion::sdk::MetaWearSdkBridge& bridge,
-            SyncState& state,
-            int timeout_ms
-        ) {
-            state.anonymous_signals.clear();
-            state.anonymous_discovery_done = false;
-            state.anonymous_discovery_status = -999;
-
-            MblMwMetaWearBoard* board =
-                bridge.board();
-
-            if (board == nullptr) {
-                throw std::runtime_error(
-                    "Cannot discover loggers from a null MetaWear board"
-                );
-            }
-
-            mbl_mw_metawearboard_create_anonymous_datasignals(
-                board,
-                &state,
-                onAnonymousSignalsCreated
-            );
-
-            const auto deadline =
-                std::chrono::steady_clock::now() +
-                std::chrono::milliseconds(timeout_ms);
-
-            while (
-                !state.anonymous_discovery_done.load() &&
-                std::chrono::steady_clock::now() < deadline
-                ) {
-                bridge.pumpOnce(100);
-                std::this_thread::sleep_for(
-                    std::chrono::milliseconds(10)
-                );
-            }
-
-            if (!state.anonymous_discovery_done.load()) {
-                state.anonymous_discovery_status = -1;
-                return false;
-            }
-
-            return
-                state.anonymous_discovery_status.load() == 0;
-        }
-
-        bool startsWith(
-            const std::string& value,
-            const std::string& prefix
-        ) {
-            return
-                value.size() >= prefix.size() &&
-                value.compare(
-                    0,
-                    prefix.size(),
-                    prefix
-                ) == 0;
-        }
-
-        enum class AnonymousSignalKind {
-            Acceleration,
-            AngularVelocity,
-            Battery,
-            Unknown
-        };
-
-        AnonymousSignalKind classifyAnonymousSignal(
-            const std::string& identifier
-        ) {
-            /*
-             * Full-vector IMU loggers created by RecordStartCommand are named
-             * "acceleration" and "angular-velocity".  Processor chains append
-             * ":..." to the root identifier, so accept those as well.
-             *
-             * Do not treat battery[0] / battery[1] component loggers as the full
-             * battery-state logger because writeBatteryDataRow expects
-             * MblMwBatteryState.
-             */
-            if (
-                identifier == "acceleration" ||
-                startsWith(
-                    identifier,
-                    "acceleration:"
-                )
-                ) {
-                return AnonymousSignalKind::Acceleration;
-            }
-
-            if (
-                identifier == "angular-velocity" ||
-                startsWith(
-                    identifier,
-                    "angular-velocity:"
-                )
-                ) {
-                return AnonymousSignalKind::AngularVelocity;
-            }
-
-            if (identifier == "battery") {
-                return AnonymousSignalKind::Battery;
-            }
-
-            return AnonymousSignalKind::Unknown;
-        }
-
-    } // namespace
+namespace {
+
+constexpr bool CLEAR_AFTER_SUCCESSFUL_SYNC = false;
+
+/*
+ * The writer should easily outrun a normal 25-200 Hz recording, but keep the
+ * queue bounded so a disk failure cannot consume unbounded RAM.
+ *
+ * 262,144 records is several minutes of buffering at 200 Hz accel + gyro.
+ */
+constexpr std::size_t MAX_QUEUED_SAMPLES = 262144;
+
+enum class SampleKind {
+    Acceleration,
+    AngularVelocity,
+    Battery
+};
+
+struct QueuedSample {
+    SampleKind kind = SampleKind::Acceleration;
+    std::int64_t epoch_ms = 0;
+
+    float x = 0.0f;
+    float y = 0.0f;
+    float z = 0.0f;
+
+    std::uint16_t battery_voltage_mv = 0;
+    std::uint8_t battery_charge_percent = 0;
+};
+
+struct TimedVectorSample {
+    std::int64_t epoch_ms = 0;
+    float x = 0.0f;
+    float y = 0.0f;
+    float z = 0.0f;
+};
+
+struct SyncState {
+    CommandOutput* output = nullptr;
+    bool write_imu_csv = false;
+    bool battery_enabled = false;
+
+    std::ofstream imu_csv;
+    std::ofstream xsens_csv;
+    std::ofstream battery_csv;
+
+    SyncProgressCallback progress_callback;
 
     /*
-     * Stateless sync entry point.
+     * Writer-thread-only timestamp state.
      *
-     * All logger routing is reconstructed from the connected MMS+ at runtime.
+     * Keep timestamps numeric.  Formatting millions of UTC strings was a major
+     * source of CPU work in the old callback path.
      */
-    int runSyncCommand(
-        const std::string& port_name,
-        const std::string& output_path,
-        SyncProgressCallback progress_callback
-    ) {
-        using namespace std::chrono_literals;
+    std::optional<std::int64_t> first_sdk_epoch_ms;
 
-        /*
-         * These objects must outlive every MetaWear callback that references them.
-         * SyncState is declared before the transport/bridge so it is destroyed last.
-         */
-        SyncState sync_state;
-        sync_state.progress_callback =
-            std::move(progress_callback);
+    /*
+     * Producer/consumer queue.  MetaWear callbacks are producers; csvWriterMain
+     * is the only consumer.
+     */
+    std::mutex queue_mutex;
+    std::condition_variable queue_cv;
+    std::deque<QueuedSample> sample_queue;
+    bool producers_finished = false;
 
-        MblMwLogDownloadHandler download_handler = {};
+    std::atomic<bool> queue_overflow{ false };
+    std::atomic<bool> writer_failed{ false };
 
-        headmotion::transport::SerialConfig config;
-        config.port_name = port_name;
-        config.baud_rate = 115200;
-        config.data_bits = 8;
-        config.stop_bits = 1;
-        config.assert_dtr = true;
-        config.assert_rts = true;
-        config.open_delay = 100ms;
+    std::mutex writer_error_mutex;
+    std::string writer_error;
 
-        auto serial =
-            headmotion::transport::SerialPortFactory::
-            create(config);
+    /*
+     * Anonymous logger discovery state.
+     */
+    std::atomic<bool> anonymous_discovery_done{ false };
+    std::atomic<std::int32_t> anonymous_discovery_status{ -999 };
+    std::vector<MblMwAnonymousDataSignal*> anonymous_signals;
 
-        headmotion::metawear::MetaWearUsbTransport usb(
-            *serial
-        );
+    std::atomic<bool> download_started{ false };
+    std::atomic<bool> download_done{ false };
 
-        std::cout
-            << "Opening "
-            << port_name
-            << "\n";
+    std::atomic<std::uint32_t> entries_left{ 0 };
+    std::atomic<std::uint32_t> total_entries{ 0 };
 
-        usb.open();
+    /*
+     * Counters are atomic because the USB/download thread reports them while the
+     * writer thread updates them.
+     */
+    std::atomic<std::uint64_t> imu_samples_received{ 0 };
+    std::atomic<std::uint64_t> battery_samples_received{ 0 };
 
-        headmotion::sdk::MetaWearSdkBridge bridge(usb);
+    std::atomic<std::uint64_t> imu_rows_written{ 0 };
+    std::atomic<std::uint64_t> xsens_rows_written{ 0 };
+    std::atomic<std::uint64_t> battery_rows_written{ 0 };
 
-        /*
-         * Stateless initialization:
-         *
-         * Do not deserialize any previous SDK state.  Build a new SDK board from
-         * the connected MMS+ every time sync runs.
-         */
-        std::cout
-            << "Initializing fresh SDK board over USB\n";
+    std::uint64_t xsens_packet_counter = 0;
+    std::uint64_t xsens_unmatched_accel = 0;
+    std::uint64_t xsens_unmatched_gyro = 0;
+    std::uint32_t xsens_pair_tolerance_ms = 20;
 
-        const bool initialized =
-            bridge.initialize(5000);
+    std::atomic<std::uint64_t> unknown_entries{ 0 };
+    std::atomic<std::uint64_t> unhandled_entries{ 0 };
+};
 
-        if (!initialized) {
-            std::cerr
-                << "SDK init failed, status="
-                << bridge.initializeStatus()
-                << "\n";
+struct CsvOutputPaths {
+    std::filesystem::path imu;
+    std::filesystem::path xsens;
+    std::filesystem::path battery;
+};
 
-            return 2;
-        }
+CsvOutputPaths chooseUnusedCsvOutputPaths(
+    const std::filesystem::path& output_dir
+) {
+    for (std::uint64_t index = 0; ; ++index) {
+        const std::string suffix =
+            index == 0
+            ? std::string{}
+            : "_" + std::to_string(index);
 
-        /*
-         * Ask the physical board which logger routes currently exist.
-         *
-         * This replaces:
-         *   - board_state.bin
-         *   - logger_metadata.txt
-         *   - saved logger IDs
-         */
-        std::cout
-            << "Discovering logger routes from MMS+ board state\n";
-
-        if (!discoverAnonymousSignals(
-            bridge,
-            sync_state,
-            10000
-        )) {
-            std::cerr
-                << "Anonymous logger discovery failed, status="
-                << sync_state.anonymous_discovery_status.load()
-                << "\n";
-
-            return 4;
-        }
-
-        std::cout
-            << "Discovered "
-            << sync_state.anonymous_signals.size()
-            << " anonymous logger signal";
-
-        if (sync_state.anonymous_signals.size() != 1) {
-            std::cout << "s";
-        }
-
-        std::cout << ":\n";
-
-        MblMwAnonymousDataSignal* accel_signal = nullptr;
-        MblMwAnonymousDataSignal* gyro_signal = nullptr;
-        MblMwAnonymousDataSignal* battery_signal = nullptr;
-
-        std::vector<std::string> unknown_signal_identifiers;
-
-        for (
-            std::size_t i = 0;
-            i < sync_state.anonymous_signals.size();
-            ++i
-            ) {
-            MblMwAnonymousDataSignal* signal =
-                sync_state.anonymous_signals[i];
-
-            if (signal == nullptr) {
-                std::cout
-                    << "  ["
-                    << i
-                    << "] <null>\n";
-
-                continue;
-            }
-
-            const char* identifier_ptr =
-                mbl_mw_anonymous_datasignal_get_identifier(
-                    signal
-                );
-
-            const std::string identifier =
-                identifier_ptr != nullptr
-                ? std::string(identifier_ptr)
-                : std::string{};
-
-            std::cout
-                << "  ["
-                << i
-                << "] "
-                << (
-                    identifier.empty()
-                    ? "<unnamed>"
-                    : identifier
-                    )
-                << "\n";
-
-            switch (
-                classifyAnonymousSignal(identifier)
-                ) {
-            case AnonymousSignalKind::Acceleration:
-                if (accel_signal != nullptr) {
-                    std::cerr
-                        << "Multiple accelerometer logger routes were discovered. "
-                        << "Refusing to guess which one contains the head-motion data.\n";
-
-                    return 4;
-                }
-
-                accel_signal = signal;
-                break;
-
-            case AnonymousSignalKind::AngularVelocity:
-                if (gyro_signal != nullptr) {
-                    std::cerr
-                        << "Multiple gyro logger routes were discovered. "
-                        << "Refusing to guess which one contains the head-motion data.\n";
-
-                    return 4;
-                }
-
-                gyro_signal = signal;
-                break;
-
-            case AnonymousSignalKind::Battery:
-                if (battery_signal != nullptr) {
-                    std::cerr
-                        << "Multiple full battery logger routes were discovered. "
-                        << "Refusing to guess which one should be used.\n";
-
-                    return 4;
-                }
-
-                battery_signal = signal;
-                break;
-
-            case AnonymousSignalKind::Unknown:
-                unknown_signal_identifiers.push_back(
-                    identifier.empty()
-                    ? "<unnamed>"
-                    : identifier
-                );
-                break;
-            }
-        }
-
-        if (accel_signal == nullptr) {
-            std::cerr
-                << "No anonymous accelerometer logger was discovered.\n";
-
-            return 4;
-        }
-
-        if (gyro_signal == nullptr) {
-            std::cerr
-                << "No anonymous gyro logger was discovered.\n";
-
-            return 4;
-        }
-
-        if (!unknown_signal_identifiers.empty()) {
-            std::cerr
-                << "WARNING: "
-                << unknown_signal_identifiers.size()
-                << " unrecognized logger route";
-
-            if (unknown_signal_identifiers.size() != 1) {
-                std::cerr << "s";
-            }
-
-            std::cerr
-                << " will not be written by this sync:\n";
-
-            for (
-                const auto& identifier :
-                unknown_signal_identifiers
-                ) {
-                std::cerr
-                    << "  "
-                    << identifier
-                    << "\n";
-            }
-        }
-
-        const bool battery_enabled =
-            battery_signal != nullptr;
-
-        std::cout
-            << "Accelerometer logger: discovered\n"
-            << "Gyro logger: discovered\n"
-            << "Battery logger: "
-            << (
-                battery_enabled
-                ? "discovered"
-                : "not present"
-                )
-            << "\n";
-
-        /*
-         * We no longer load sample-rate metadata from the host.  Keep the existing
-         * conservative pairing tolerance for the Xsens-compatible export until the
-         * sensor configuration is queried directly from the board.
-         */
-        std::cout
-            << "Xsens accel/gyro pairing tolerance: "
-            << sync_state.xsens_pair_tolerance_ms
-            << " ms\n";
-
-        const std::filesystem::path output_dir{
-            output_path
+        CsvOutputPaths candidate{
+            output_dir / ("imu" + suffix + ".csv"),
+            output_dir / ("imu_xsens" + suffix + ".csv"),
+            output_dir / ("battery" + suffix + ".csv")
         };
 
-        std::filesystem::create_directories(
-            output_dir
+        /*
+         * Reserve the same suffix for the whole session even when imu.csv is not
+         * requested.  This keeps related output names aligned.
+         */
+        if (
+            !std::filesystem::exists(candidate.imu) &&
+            !std::filesystem::exists(candidate.xsens) &&
+            !std::filesystem::exists(candidate.battery)
+        ) {
+            return candidate;
+        }
+    }
+}
+
+bool openCsv(
+    CommandOutput& output,
+    std::ofstream& stream,
+    const std::filesystem::path& path,
+    const char* header
+) {
+    stream.open(
+        path,
+        std::ios::out |
+        std::ios::binary |
+        std::ios::trunc
+    );
+
+    if (!stream.is_open()) {
+        output.error(
+            "csv_open_failed",
+            "Failed to open CSV: " + path.string()
+        );
+        return false;
+    }
+
+    stream << header;
+
+    if (!stream) {
+        output.error(
+            "csv_header_failed",
+            "Failed to write CSV header: " + path.string()
+        );
+        stream.close();
+        return false;
+    }
+
+    return true;
+}
+
+void closeCsvs(SyncState& state) {
+    if (state.imu_csv.is_open()) {
+        state.imu_csv.flush();
+        state.imu_csv.close();
+    }
+
+    if (state.xsens_csv.is_open()) {
+        state.xsens_csv.flush();
+        state.xsens_csv.close();
+    }
+
+    if (state.battery_csv.is_open()) {
+        state.battery_csv.flush();
+        state.battery_csv.close();
+    }
+}
+
+void pumpFor(
+    headmotion::sdk::MetaWearSdkBridge& bridge,
+    int total_ms
+) {
+    const auto deadline =
+        std::chrono::steady_clock::now() +
+        std::chrono::milliseconds(total_ms);
+
+    while (std::chrono::steady_clock::now() < deadline) {
+        bridge.pumpOnce(50);
+        std::this_thread::sleep_for(
+            std::chrono::milliseconds(10)
+        );
+    }
+}
+
+const char* dataTypeName(MblMwDataTypeId type_id) {
+    switch (type_id) {
+    case MBL_MW_DT_ID_UINT32:
+        return "UINT32";
+
+    case MBL_MW_DT_ID_FLOAT:
+        return "FLOAT";
+
+    case MBL_MW_DT_ID_CARTESIAN_FLOAT:
+        return "CARTESIAN_FLOAT";
+
+    case MBL_MW_DT_ID_INT32:
+        return "INT32";
+
+    case MBL_MW_DT_ID_BYTE_ARRAY:
+        return "BYTE_ARRAY";
+
+    case MBL_MW_DT_ID_BATTERY_STATE:
+        return "BATTERY_STATE";
+
+    default:
+        return "UNKNOWN";
+    }
+}
+
+void printUnexpectedData(
+    SyncState* state,
+    const char* stream_name,
+    const MblMwData* data,
+    const char* reason
+) {
+    if (state == nullptr || state->output == nullptr) {
+        return;
+    }
+
+    if (data == nullptr) {
+        state->output->warning(
+            "unexpected_data",
+            std::string(stream_name) +
+                ": null MblMwData: " +
+                reason
+        );
+        return;
+    }
+
+    state->output->event(
+        "warning",
+        {
+            {"code", "unexpected_data"},
+            {"stream", stream_name},
+            {"reason", reason},
+            {"epoch_ms", static_cast<std::int64_t>(data->epoch)},
+            {"type_id", static_cast<int>(data->type_id)},
+            {"type_name", dataTypeName(data->type_id)},
+            {"length", static_cast<int>(data->length)}
+        }
+    );
+}
+
+std::uint64_t timestampDifferenceMs(
+    std::int64_t lhs,
+    std::int64_t rhs
+) {
+    return lhs >= rhs
+        ? static_cast<std::uint64_t>(lhs - rhs)
+        : static_cast<std::uint64_t>(rhs - lhs);
+}
+
+void setWriterError(
+    SyncState& state,
+    std::string message
+) {
+    {
+        std::lock_guard<std::mutex> lock(
+            state.writer_error_mutex
         );
 
-        const CsvOutputPaths csv_paths =
-            chooseUnusedCsvOutputPaths(
-                output_dir
-            );
-
-        const auto& imu_path =
-            csv_paths.imu;
-
-        const auto& xsens_path =
-            csv_paths.xsens;
-
-        const auto& battery_path =
-            csv_paths.battery;
-
-        std::cout
-            << "IMU output: "
-            << imu_path
-            << "\n";
-
-        if (!openCsvForAppend(
-            sync_state.imu_csv,
-            imu_path,
-            "epoch_ms,elapsed_ms,utc_timestamp,sensor,x,y,z\n"
-        )) {
-            return 3;
+        if (state.writer_error.empty()) {
+            state.writer_error = std::move(message);
         }
+    }
 
-        std::cout
-            << "Xsens-compatible output: "
-            << xsens_path
-            << "\n";
+    state.writer_failed = true;
+    state.queue_cv.notify_all();
+}
 
-        if (!openCsvForAppend(
-            sync_state.xsens_csv,
-            xsens_path,
-            "PacketCounter,SampleTimeFine,Euler_X,Euler_Y,Euler_Z,"
-            "Acc_X,Acc_Y,Acc_Z,Gyr_X,Gyr_Y,Gyr_Z,elapsed_ms,utc_timestamp\n"
-        )) {
-            sync_state.imu_csv.close();
-            return 3;
-        }
+std::string writerError(SyncState& state) {
+    std::lock_guard<std::mutex> lock(
+        state.writer_error_mutex
+    );
 
-        sync_state.xsens_accel_temp.open(
-            csv_paths.xsens_accel_temp,
-            std::ios::out |
-            std::ios::binary |
-            std::ios::trunc
-        );
+    return state.writer_error;
+}
 
-        sync_state.xsens_gyro_temp.open(
-            csv_paths.xsens_gyro_temp,
-            std::ios::out |
-            std::ios::binary |
-            std::ios::trunc
+bool enqueueSample(
+    SyncState& state,
+    QueuedSample sample
+) {
+    bool notify_writer = false;
+
+    {
+        std::lock_guard<std::mutex> lock(
+            state.queue_mutex
         );
 
         if (
-            !sync_state.xsens_accel_temp ||
-            !sync_state.xsens_gyro_temp
-            ) {
-            std::cerr
-                << "Failed to open temporary IMU pairing files\n";
-
-            closeCsvs(
-                sync_state,
-                false
-            );
-
-            return 3;
+            state.writer_failed.load() ||
+            state.producers_finished
+        ) {
+            return false;
         }
 
-        if (battery_enabled) {
-            std::cout
-                << "Battery output: "
-                << battery_path
-                << "\n";
+        if (
+            state.sample_queue.size() >=
+            MAX_QUEUED_SAMPLES
+        ) {
+            state.queue_overflow = true;
+            state.writer_failed = true;
 
-            if (!openCsvForAppend(
-                sync_state.battery_csv,
-                battery_path,
-                "epoch_ms,elapsed_ms,utc_timestamp,voltage_mv,charge_percent\n"
-            )) {
-                closeCsvs(
-                    sync_state,
-                    false
+            {
+                std::lock_guard<std::mutex> error_lock(
+                    state.writer_error_mutex
                 );
 
-                return 3;
+                if (state.writer_error.empty()) {
+                    state.writer_error =
+                        "CSV writer queue overflowed; disk/CPU writer "
+                        "could not keep up with the MMS+ download";
+                }
+            }
+
+            notify_writer = true;
+        }
+        else {
+            notify_writer =
+                state.sample_queue.empty();
+
+            state.sample_queue.push_back(
+                std::move(sample)
+            );
+        }
+    }
+
+    if (notify_writer) {
+        state.queue_cv.notify_one();
+    }
+
+    return !state.writer_failed.load();
+}
+
+void markFirstEpoch(
+    SyncState& state,
+    std::int64_t epoch_ms
+) {
+    if (!state.first_sdk_epoch_ms.has_value()) {
+        state.first_sdk_epoch_ms = epoch_ms;
+    }
+}
+
+std::int64_t elapsedMs(
+    SyncState& state,
+    std::int64_t epoch_ms
+) {
+    markFirstEpoch(
+        state,
+        epoch_ms
+    );
+
+    return
+        epoch_ms -
+        *state.first_sdk_epoch_ms;
+}
+
+std::string formatUtcTimestamp(
+    std::int64_t epoch_ms
+) {
+    std::int64_t seconds =
+        epoch_ms / 1000;
+
+    std::int64_t milliseconds =
+        epoch_ms % 1000;
+
+    if (milliseconds < 0) {
+        milliseconds += 1000;
+        --seconds;
+    }
+
+    const std::time_t time_value =
+        static_cast<std::time_t>(
+            seconds
+        );
+
+    std::tm utc_tm{};
+
+#ifdef _WIN32
+    if (gmtime_s(
+        &utc_tm,
+        &time_value
+    ) != 0) {
+        return "INVALID_UTC";
+    }
+#else
+    if (gmtime_r(
+        &time_value,
+        &utc_tm
+    ) == nullptr) {
+        return "INVALID_UTC";
+    }
+#endif
+
+    std::ostringstream formatted;
+
+    formatted
+        << std::put_time(
+            &utc_tm,
+            "%Y-%m-%dT%H:%M:%S"
+        )
+        << "."
+        << std::setw(3)
+        << std::setfill('0')
+        << milliseconds
+        << "Z";
+
+    return formatted.str();
+}
+
+bool writeLegacyImuRow(
+    SyncState& state,
+    const QueuedSample& sample,
+    const char* sensor_name
+) {
+    if (!state.write_imu_csv) {
+        return true;
+    }
+
+    if (!state.imu_csv.is_open()) {
+        setWriterError(
+            state,
+            "Legacy IMU CSV was requested but is not open"
+        );
+        return false;
+    }
+
+    state.imu_csv
+        << sample.epoch_ms
+        << ","
+        << elapsedMs(
+            state,
+            sample.epoch_ms
+        )
+        << ","
+        << sensor_name
+        << ","
+        << sample.x
+        << ","
+        << sample.y
+        << ","
+        << sample.z
+        << "\n";
+
+    if (!state.imu_csv) {
+        setWriterError(
+            state,
+            "Failed while writing legacy IMU CSV"
+        );
+        return false;
+    }
+
+    state.imu_rows_written++;
+    return true;
+}
+
+bool writeBatteryRow(
+    SyncState& state,
+    const QueuedSample& sample
+) {
+    if (!state.battery_enabled) {
+        return true;
+    }
+
+    if (!state.battery_csv.is_open()) {
+        setWriterError(
+            state,
+            "Battery logger is enabled but battery CSV is not open"
+        );
+        return false;
+    }
+
+    state.battery_csv
+        << sample.epoch_ms
+        << ","
+        << elapsedMs(
+            state,
+            sample.epoch_ms
+        )
+        << ","
+        << sample.battery_voltage_mv
+        << ","
+        << static_cast<int>(
+            sample.battery_charge_percent
+        )
+        << "\n";
+
+    if (!state.battery_csv) {
+        setWriterError(
+            state,
+            "Failed while writing battery CSV"
+        );
+        return false;
+    }
+
+    state.battery_rows_written++;
+    return true;
+}
+
+bool writeXsensWideRow(
+    SyncState& state,
+    const TimedVectorSample& accel,
+    const TimedVectorSample& gyro
+) {
+    /*
+     * UTC formatting happens on the CSV writer thread, never in the SDK
+     * callback path.  This preserves the Xsens export timestamp while keeping
+     * download callbacks lightweight.
+     */
+    const std::int64_t elapsed_ms =
+        elapsedMs(
+            state,
+            gyro.epoch_ms
+        );
+
+    const std::string utc_timestamp =
+        formatUtcTimestamp(
+            gyro.epoch_ms
+        );
+
+    state.xsens_csv
+        << state.xsens_packet_counter++
+        << ","
+        << gyro.epoch_ms
+        << ",0,0,0,"
+        << accel.x
+        << ","
+        << accel.y
+        << ","
+        << accel.z
+        << ","
+        << gyro.x
+        << ","
+        << gyro.y
+        << ","
+        << gyro.z
+        << ","
+        << elapsed_ms
+        << ","
+        << utc_timestamp
+        << "\n";
+
+    if (!state.xsens_csv) {
+        setWriterError(
+            state,
+            "Failed while writing Xsens-compatible CSV"
+        );
+        return false;
+    }
+
+    state.xsens_rows_written++;
+    return true;
+}
+
+bool drainPairQueues(
+    SyncState& state,
+    std::deque<TimedVectorSample>& accel_samples,
+    std::deque<TimedVectorSample>& gyro_samples
+) {
+    while (
+        !accel_samples.empty() &&
+        !gyro_samples.empty()
+    ) {
+        const TimedVectorSample& accel =
+            accel_samples.front();
+
+        const TimedVectorSample& gyro =
+            gyro_samples.front();
+
+        const std::uint64_t difference_ms =
+            timestampDifferenceMs(
+                accel.epoch_ms,
+                gyro.epoch_ms
+            );
+
+        if (
+            difference_ms <=
+            state.xsens_pair_tolerance_ms
+        ) {
+            if (!writeXsensWideRow(
+                state,
+                accel,
+                gyro
+            )) {
+                return false;
+            }
+
+            accel_samples.pop_front();
+            gyro_samples.pop_front();
+            continue;
+        }
+
+        if (accel.epoch_ms < gyro.epoch_ms) {
+            ++state.xsens_unmatched_accel;
+            accel_samples.pop_front();
+        }
+        else {
+            ++state.xsens_unmatched_gyro;
+            gyro_samples.pop_front();
+        }
+    }
+
+    return true;
+}
+
+void csvWriterMain(
+    SyncState* state
+) {
+    if (state == nullptr) {
+        return;
+    }
+
+    std::deque<TimedVectorSample> accel_samples;
+    std::deque<TimedVectorSample> gyro_samples;
+    std::deque<QueuedSample> batch;
+
+    try {
+        while (true) {
+            {
+                std::unique_lock<std::mutex> lock(
+                    state->queue_mutex
+                );
+
+                state->queue_cv.wait(
+                    lock,
+                    [state] {
+                        return
+                            state->writer_failed.load() ||
+                            state->producers_finished ||
+                            !state->sample_queue.empty();
+                    }
+                );
+
+                if (
+                    state->writer_failed.load() &&
+                    state->sample_queue.empty()
+                ) {
+                    break;
+                }
+
+                if (state->sample_queue.empty()) {
+                    if (state->producers_finished) {
+                        break;
+                    }
+
+                    continue;
+                }
+
+                batch.clear();
+                batch.swap(
+                    state->sample_queue
+                );
+            }
+
+            for (const QueuedSample& sample : batch) {
+                if (state->writer_failed.load()) {
+                    break;
+                }
+
+                /*
+                 * Establish the elapsed-time origin from the first callback
+                 * sample, independent of which output files are enabled.
+                 */
+                markFirstEpoch(
+                    *state,
+                    sample.epoch_ms
+                );
+
+                if (
+                    sample.kind ==
+                    SampleKind::Acceleration
+                ) {
+                    if (!writeLegacyImuRow(
+                        *state,
+                        sample,
+                        "accel_g"
+                    )) {
+                        break;
+                    }
+
+                    accel_samples.push_back(
+                        TimedVectorSample{
+                            sample.epoch_ms,
+                            sample.x,
+                            sample.y,
+                            sample.z
+                        }
+                    );
+                }
+                else if (
+                    sample.kind ==
+                    SampleKind::AngularVelocity
+                ) {
+                    if (!writeLegacyImuRow(
+                        *state,
+                        sample,
+                        "gyro_dps"
+                    )) {
+                        break;
+                    }
+
+                    gyro_samples.push_back(
+                        TimedVectorSample{
+                            sample.epoch_ms,
+                            sample.x,
+                            sample.y,
+                            sample.z
+                        }
+                    );
+                }
+                else {
+                    if (!writeBatteryRow(
+                        *state,
+                        sample
+                    )) {
+                        break;
+                    }
+
+                    continue;
+                }
+
+                if (!drainPairQueues(
+                    *state,
+                    accel_samples,
+                    gyro_samples
+                )) {
+                    break;
+                }
+            }
+
+            if (state->writer_failed.load()) {
+                break;
             }
         }
 
-        MblMwMetaWearBoard* board =
-            bridge.board();
+        /*
+         * Any remaining samples cannot be paired after all producers have
+         * finished.
+         */
+        state->xsens_unmatched_accel +=
+            accel_samples.size();
 
-        if (board == nullptr) {
-            std::cerr
-                << "SDK returned a null board after initialization\n";
+        state->xsens_unmatched_gyro +=
+            gyro_samples.size();
 
-            closeCsvs(
-                sync_state,
-                battery_enabled
-            );
+        if (state->imu_csv.is_open()) {
+            state->imu_csv.flush();
 
-            return 2;
+            if (!state->imu_csv) {
+                setWriterError(
+                    *state,
+                    "Failed while flushing legacy IMU CSV"
+                );
+            }
         }
 
-        /*
-         * Flush the current flash page so the newest samples are visible to the
-         * download before starting the readout.
-         */
-        std::cout
-            << "Flushing MMS log page before download\n";
+        if (state->xsens_csv.is_open()) {
+            state->xsens_csv.flush();
 
-        mbl_mw_logging_flush_page(board);
+            if (!state->xsens_csv) {
+                setWriterError(
+                    *state,
+                    "Failed while flushing Xsens-compatible CSV"
+                );
+            }
+        }
+
+        if (state->battery_csv.is_open()) {
+            state->battery_csv.flush();
+
+            if (!state->battery_csv) {
+                setWriterError(
+                    *state,
+                    "Failed while flushing battery CSV"
+                );
+            }
+        }
+    }
+    catch (const std::exception& error) {
+        setWriterError(
+            *state,
+            std::string(
+                "CSV writer thread failed: "
+            ) +
+            error.what()
+        );
+    }
+    catch (...) {
+        setWriterError(
+            *state,
+            "CSV writer thread failed with an unknown exception"
+        );
+    }
+}
+
+void finishWriter(
+    SyncState& state,
+    std::thread& writer_thread
+) {
+    {
+        std::lock_guard<std::mutex> lock(
+            state.queue_mutex
+        );
+
+        state.producers_finished = true;
+    }
+
+    state.queue_cv.notify_all();
+
+    if (writer_thread.joinable()) {
+        writer_thread.join();
+    }
+}
+
+void markDownloadStarted(
+    SyncState* state
+) {
+    if (state != nullptr) {
+        state->download_started = true;
+    }
+}
+
+bool validateVectorData(
+    SyncState* state,
+    const char* sensor,
+    const MblMwData* data
+) {
+    if (data == nullptr) {
+        printUnexpectedData(
+            state,
+            sensor,
+            data,
+            "data is null"
+        );
+        return false;
+    }
+
+    if (data->value == nullptr) {
+        printUnexpectedData(
+            state,
+            sensor,
+            data,
+            "data->value is null"
+        );
+        return false;
+    }
+
+    if (
+        data->type_id !=
+        MBL_MW_DT_ID_CARTESIAN_FLOAT
+    ) {
+        printUnexpectedData(
+            state,
+            sensor,
+            data,
+            "expected CARTESIAN_FLOAT"
+        );
+        return false;
+    }
+
+    if (
+        data->length <
+        sizeof(MblMwCartesianFloat)
+    ) {
+        printUnexpectedData(
+            state,
+            sensor,
+            data,
+            "value is shorter than MblMwCartesianFloat"
+        );
+        return false;
+    }
+
+    return true;
+}
+
+void enqueueVectorData(
+    SyncState* state,
+    SampleKind kind,
+    const char* sensor,
+    const MblMwData* data
+) {
+    if (state == nullptr) {
+        return;
+    }
+
+    markDownloadStarted(state);
+
+    if (!validateVectorData(
+        state,
+        sensor,
+        data
+    )) {
+        return;
+    }
+
+    const auto* value =
+        static_cast<const MblMwCartesianFloat*>(
+            data->value
+        );
+
+    QueuedSample sample;
+    sample.kind = kind;
+    sample.epoch_ms = data->epoch;
+    sample.x = value->x;
+    sample.y = value->y;
+    sample.z = value->z;
+
+    state->imu_samples_received++;
+
+    enqueueSample(
+        *state,
+        std::move(sample)
+    );
+}
+
+void onAccelLoggerData(
+    void* context,
+    const MblMwData* data
+) {
+    enqueueVectorData(
+        static_cast<SyncState*>(context),
+        SampleKind::Acceleration,
+        "accel_g",
+        data
+    );
+}
+
+void onGyroLoggerData(
+    void* context,
+    const MblMwData* data
+) {
+    enqueueVectorData(
+        static_cast<SyncState*>(context),
+        SampleKind::AngularVelocity,
+        "gyro_dps",
+        data
+    );
+}
+
+void onBatteryLoggerData(
+    void* context,
+    const MblMwData* data
+) {
+    auto* state =
+        static_cast<SyncState*>(context);
+
+    if (state == nullptr) {
+        return;
+    }
+
+    markDownloadStarted(state);
+
+    if (data == nullptr) {
+        printUnexpectedData(
+            state,
+            "battery",
+            data,
+            "data is null"
+        );
+        return;
+    }
+
+    if (data->value == nullptr) {
+        printUnexpectedData(
+            state,
+            "battery",
+            data,
+            "data->value is null"
+        );
+        return;
+    }
+
+    if (
+        data->type_id !=
+        MBL_MW_DT_ID_BATTERY_STATE
+    ) {
+        printUnexpectedData(
+            state,
+            "battery",
+            data,
+            "expected BATTERY_STATE"
+        );
+        return;
+    }
+
+    const auto* battery =
+        static_cast<const MblMwBatteryState*>(
+            data->value
+        );
+
+    QueuedSample sample;
+    sample.kind = SampleKind::Battery;
+    sample.epoch_ms = data->epoch;
+    sample.battery_voltage_mv =
+        battery->voltage;
+    sample.battery_charge_percent =
+        battery->charge;
+
+    state->battery_samples_received++;
+
+    enqueueSample(
+        *state,
+        std::move(sample)
+    );
+}
+
+void onProgressUpdate(
+    void* context,
+    std::uint32_t entries_left,
+    std::uint32_t total_entries
+) {
+    auto* state =
+        static_cast<SyncState*>(context);
+
+    if (state == nullptr) {
+        return;
+    }
+
+    state->download_started = true;
+    state->entries_left = entries_left;
+    state->total_entries = total_entries;
+
+    if (state->output != nullptr) {
+        state->output->progress(
+            entries_left,
+            total_entries
+        );
+    }
+
+    if (state->progress_callback) {
+        try {
+            state->progress_callback(
+                entries_left,
+                total_entries
+            );
+        }
+        catch (...) {
+            /*
+             * Never unwind a C++ exception through a MetaWear C callback.
+             */
+        }
+    }
+
+    if (entries_left == 0) {
+        state->download_done = true;
+    }
+}
+
+void onUnknownEntry(
+    void* context,
+    std::uint8_t id,
+    std::int64_t epoch,
+    const std::uint8_t* data,
+    std::uint8_t length
+) {
+    (void)id;
+    (void)epoch;
+    (void)data;
+    (void)length;
+
+    auto* state =
+        static_cast<SyncState*>(context);
+
+    if (state != nullptr) {
+        state->unknown_entries++;
+    }
+}
+
+void onUnhandledEntry(
+    void* context,
+    const MblMwData* data
+) {
+    (void)data;
+
+    auto* state =
+        static_cast<SyncState*>(context);
+
+    if (state != nullptr) {
+        state->unhandled_entries++;
+    }
+}
+
+std::uint64_t totalSamplesReceived(
+    const SyncState& state
+) {
+    return
+        state.imu_samples_received.load() +
+        state.battery_samples_received.load();
+}
+
+void onAnonymousSignalsCreated(
+    void* context,
+    MblMwMetaWearBoard* board,
+    MblMwAnonymousDataSignal** signals,
+    std::uint32_t size
+) {
+    (void)board;
+
+    auto* state =
+        static_cast<SyncState*>(context);
+
+    if (state == nullptr) {
+        return;
+    }
+
+    state->anonymous_signals.clear();
+
+    /*
+     * SDK discovery failures use signals == nullptr and put the status value
+     * in size.  nullptr + 0 is a legitimate "no loggers" result.
+     */
+    if (signals == nullptr) {
+        state->anonymous_discovery_status =
+            size == 0
+            ? 0
+            : static_cast<std::int32_t>(size);
+
+        state->anonymous_discovery_done = true;
+        return;
+    }
+
+    try {
+        state->anonymous_signals.assign(
+            signals,
+            signals + size
+        );
+
+        state->anonymous_discovery_status = 0;
+    }
+    catch (...) {
+        state->anonymous_signals.clear();
+        state->anonymous_discovery_status = -2;
+    }
+
+    state->anonymous_discovery_done = true;
+}
+
+bool discoverAnonymousSignals(
+    headmotion::sdk::MetaWearSdkBridge& bridge,
+    SyncState& state,
+    int timeout_ms
+) {
+    state.anonymous_signals.clear();
+    state.anonymous_discovery_done = false;
+    state.anonymous_discovery_status = -999;
+
+    MblMwMetaWearBoard* board =
+        bridge.board();
+
+    if (board == nullptr) {
+        throw std::runtime_error(
+            "Cannot discover loggers from a null MetaWear board"
+        );
+    }
+
+    mbl_mw_metawearboard_create_anonymous_datasignals(
+        board,
+        &state,
+        onAnonymousSignalsCreated
+    );
+
+    const auto deadline =
+        std::chrono::steady_clock::now() +
+        std::chrono::milliseconds(timeout_ms);
+
+    while (
+        !state.anonymous_discovery_done.load() &&
+        std::chrono::steady_clock::now() < deadline
+    ) {
+        bridge.pumpOnce(100);
+        std::this_thread::sleep_for(
+            std::chrono::milliseconds(10)
+        );
+    }
+
+    if (!state.anonymous_discovery_done.load()) {
+        state.anonymous_discovery_status = -1;
+        return false;
+    }
+
+    return
+        state.anonymous_discovery_status.load() == 0;
+}
+
+bool startsWith(
+    const std::string& value,
+    const std::string& prefix
+) {
+    return
+        value.size() >= prefix.size() &&
+        value.compare(
+            0,
+            prefix.size(),
+            prefix
+        ) == 0;
+}
+
+enum class AnonymousSignalKind {
+    Acceleration,
+    AngularVelocity,
+    Battery,
+    Unknown
+};
+
+AnonymousSignalKind classifyAnonymousSignal(
+    const std::string& identifier
+) {
+    if (
+        identifier == "acceleration" ||
+        startsWith(
+            identifier,
+            "acceleration:"
+        )
+    ) {
+        return
+            AnonymousSignalKind::Acceleration;
+    }
+
+    if (
+        identifier == "angular-velocity" ||
+        startsWith(
+            identifier,
+            "angular-velocity:"
+        )
+    ) {
+        return
+            AnonymousSignalKind::AngularVelocity;
+    }
+
+    if (identifier == "battery") {
+        return
+            AnonymousSignalKind::Battery;
+    }
+
+    return
+        AnonymousSignalKind::Unknown;
+}
+
+} // namespace
+
+/*
+ * Full sync implementation.
+ *
+ * write_imu_csv == false is the normal/GUI path.
+ * write_imu_csv == true additionally creates the legacy long-format imu.csv.
+ */
+int runSyncCommand(
+    const std::string& port_name,
+    const std::string& output_path,
+    bool write_imu_csv,
+    CommandOutput& output,
+    SyncProgressCallback progress_callback
+) {
+    using namespace std::chrono_literals;
+
+    SyncState sync_state;
+    sync_state.output = &output;
+    sync_state.write_imu_csv = write_imu_csv;
+    sync_state.progress_callback = std::move(progress_callback);
+
+    output.started(
+        {
+            {"port", port_name},
+            {"output_directory", output_path},
+            {"write_legacy_imu_csv", write_imu_csv}
+        }
+    );
+
+    MblMwLogDownloadHandler download_handler = {};
+
+    headmotion::transport::SerialConfig config;
+    config.port_name = port_name;
+    config.baud_rate = 115200;
+    config.data_bits = 8;
+    config.stop_bits = 1;
+    config.assert_dtr = true;
+    config.assert_rts = true;
+    config.open_delay = 100ms;
+
+    output.status("opening_port");
+
+    auto serial =
+        headmotion::transport::SerialPortFactory::
+        create(config);
+
+    headmotion::metawear::MetaWearUsbTransport usb(
+        *serial
+    );
+
+    usb.open();
+
+    headmotion::sdk::MetaWearSdkBridge bridge(
+        usb
+    );
+
+    output.status("initializing_sdk");
+
+    const bool initialized =
+        bridge.initialize(5000);
+
+    if (!initialized) {
+        output.event(
+            "error",
+            {
+                {"code", "sdk_init_failed"},
+                {"message", "SDK initialization failed"},
+                {"sdk_status", bridge.initializeStatus()}
+            }
+        );
+        output.completed(false, 2);
+        return 2;
+    }
+
+    output.status("discovering_loggers");
+
+    if (!discoverAnonymousSignals(
+        bridge,
+        sync_state,
+        10000
+    )) {
+        output.event(
+            "error",
+            {
+                {"code", "logger_discovery_failed"},
+                {"message", "Anonymous logger discovery failed"},
+                {
+                    "sdk_status",
+                    static_cast<int>(
+                        sync_state.anonymous_discovery_status.load()
+                    )
+                }
+            }
+        );
+        output.completed(false, 4);
+        return 4;
+    }
+
+    output.event(
+        "logger_discovery",
+        {
+            {
+                "count",
+                static_cast<std::uint64_t>(
+                    sync_state.anonymous_signals.size()
+                )
+            }
+        }
+    );
+
+    MblMwAnonymousDataSignal* accel_signal = nullptr;
+    MblMwAnonymousDataSignal* gyro_signal = nullptr;
+    MblMwAnonymousDataSignal* battery_signal = nullptr;
+
+    std::vector<std::string>
+        unknown_signal_identifiers;
+
+    for (
+        std::size_t i = 0;
+        i < sync_state.anonymous_signals.size();
+        ++i
+    ) {
+        MblMwAnonymousDataSignal* signal =
+            sync_state.anonymous_signals[i];
+
+        if (signal == nullptr) {
+            output.event(
+                "warning",
+                {
+                    {"code", "null_logger_signal"},
+                    {
+                        "index",
+                        static_cast<std::uint64_t>(i)
+                    }
+                }
+            );
+            continue;
+        }
+
+        const char* identifier_ptr =
+            mbl_mw_anonymous_datasignal_get_identifier(
+                signal
+            );
+
+        const std::string identifier =
+            identifier_ptr != nullptr
+                ? std::string(identifier_ptr)
+                : std::string{};
+
+        const AnonymousSignalKind kind =
+            classifyAnonymousSignal(identifier);
+
+        const char* kind_name = "unknown";
+
+        switch (kind) {
+        case AnonymousSignalKind::Acceleration:
+            kind_name = "acceleration";
+            break;
+        case AnonymousSignalKind::AngularVelocity:
+            kind_name = "angular_velocity";
+            break;
+        case AnonymousSignalKind::Battery:
+            kind_name = "battery";
+            break;
+        case AnonymousSignalKind::Unknown:
+            break;
+        }
+
+        output.event(
+            "logger",
+            {
+                {
+                    "index",
+                    static_cast<std::uint64_t>(i)
+                },
+                {
+                    "identifier",
+                    identifier.empty()
+                        ? std::string("<unnamed>")
+                        : identifier
+                },
+                {"kind", kind_name}
+            }
+        );
+
+        switch (kind) {
+        case AnonymousSignalKind::Acceleration:
+            if (accel_signal != nullptr) {
+                output.error(
+                    "multiple_accelerometer_loggers",
+                    "Multiple accelerometer logger routes were discovered"
+                );
+                output.completed(false, 4);
+                return 4;
+            }
+
+            accel_signal = signal;
+            break;
+
+        case AnonymousSignalKind::AngularVelocity:
+            if (gyro_signal != nullptr) {
+                output.error(
+                    "multiple_gyro_loggers",
+                    "Multiple gyro logger routes were discovered"
+                );
+                output.completed(false, 4);
+                return 4;
+            }
+
+            gyro_signal = signal;
+            break;
+
+        case AnonymousSignalKind::Battery:
+            if (battery_signal != nullptr) {
+                output.error(
+                    "multiple_battery_loggers",
+                    "Multiple full battery logger routes were discovered"
+                );
+                output.completed(false, 4);
+                return 4;
+            }
+
+            battery_signal = signal;
+            break;
+
+        case AnonymousSignalKind::Unknown:
+            unknown_signal_identifiers.push_back(
+                identifier.empty()
+                    ? "<unnamed>"
+                    : identifier
+            );
+            break;
+        }
+    }
+
+    if (accel_signal == nullptr) {
+        output.error(
+            "accelerometer_logger_missing",
+            "No anonymous accelerometer logger was discovered"
+        );
+        output.completed(false, 4);
+        return 4;
+    }
+
+    if (gyro_signal == nullptr) {
+        output.error(
+            "gyro_logger_missing",
+            "No anonymous gyro logger was discovered"
+        );
+        output.completed(false, 4);
+        return 4;
+    }
+
+    for (
+        const std::string& identifier :
+        unknown_signal_identifiers
+    ) {
+        output.event(
+            "warning",
+            {
+                {"code", "unknown_logger"},
+                {"identifier", identifier},
+                {
+                    "message",
+                    "Logger will not be written by this sync"
+                }
+            }
+        );
+    }
+
+    sync_state.battery_enabled =
+        battery_signal != nullptr;
+
+    output.event(
+        "configuration",
+        {
+            {"accelerometer_logger", true},
+            {"gyro_logger", true},
+            {
+                "battery_logger",
+                sync_state.battery_enabled
+            },
+            {
+                "xsens_pair_tolerance_ms",
+                static_cast<std::uint64_t>(
+                    sync_state.xsens_pair_tolerance_ms
+                )
+            },
+            {
+                "write_legacy_imu_csv",
+                sync_state.write_imu_csv
+            },
+            {"xsens_utc_timestamp", true}
+        }
+    );
+
+    output.status("preparing_output");
+
+    const std::filesystem::path output_dir{
+        output_path
+    };
+
+    std::filesystem::create_directories(
+        output_dir
+    );
+
+    const CsvOutputPaths csv_paths =
+        chooseUnusedCsvOutputPaths(
+            output_dir
+        );
+
+    const auto& imu_path =
+        csv_paths.imu;
+
+    const auto& xsens_path =
+        csv_paths.xsens;
+
+    const auto& battery_path =
+        csv_paths.battery;
+
+    if (!openCsv(
+        output,
+        sync_state.xsens_csv,
+        xsens_path,
+        "PacketCounter,SampleTimeFine,Euler_X,Euler_Y,Euler_Z,"
+        "Acc_X,Acc_Y,Acc_Z,Gyr_X,Gyr_Y,Gyr_Z,elapsed_ms,utc_timestamp\n"
+    )) {
+        output.completed(false, 3);
+        return 3;
+    }
+
+    output.outputFile(
+        "xsens_csv",
+        xsens_path.string()
+    );
+
+    if (sync_state.write_imu_csv) {
+        if (!openCsv(
+            output,
+            sync_state.imu_csv,
+            imu_path,
+            "epoch_ms,elapsed_ms,sensor,x,y,z\n"
+        )) {
+            closeCsvs(sync_state);
+            output.completed(false, 3);
+            return 3;
+        }
+
+        output.outputFile(
+            "legacy_imu_csv",
+            imu_path.string()
+        );
+    }
+
+    if (sync_state.battery_enabled) {
+        if (!openCsv(
+            output,
+            sync_state.battery_csv,
+            battery_path,
+            "epoch_ms,elapsed_ms,voltage_mv,charge_percent\n"
+        )) {
+            closeCsvs(sync_state);
+            output.completed(false, 3);
+            return 3;
+        }
+
+        output.outputFile(
+            "battery_csv",
+            battery_path.string()
+        );
+    }
+
+    MblMwMetaWearBoard* board =
+        bridge.board();
+
+    if (board == nullptr) {
+        output.error(
+            "null_sdk_board",
+            "SDK returned a null board after initialization"
+        );
+        closeCsvs(sync_state);
+        output.completed(false, 2);
+        return 2;
+    }
+
+    /*
+     * Start the writer before subscribing so callbacks only need to enqueue
+     * samples.  UTC formatting happens on this writer thread.
+     */
+    std::thread writer_thread(
+        csvWriterMain,
+        &sync_state
+    );
+
+    output.status("flushing_log_page");
+
+    mbl_mw_logging_flush_page(board);
+
+    pumpFor(
+        bridge,
+        2000
+    );
+
+    output.status("subscribing_loggers");
+
+    mbl_mw_anonymous_datasignal_subscribe(
+        accel_signal,
+        &sync_state,
+        onAccelLoggerData
+    );
+
+    mbl_mw_anonymous_datasignal_subscribe(
+        gyro_signal,
+        &sync_state,
+        onGyroLoggerData
+    );
+
+    if (sync_state.battery_enabled) {
+        mbl_mw_anonymous_datasignal_subscribe(
+            battery_signal,
+            &sync_state,
+            onBatteryLoggerData
+        );
+    }
+
+    download_handler.context =
+        &sync_state;
+
+    download_handler.received_progress_update =
+        onProgressUpdate;
+
+    download_handler.received_unknown_entry =
+        onUnknownEntry;
+
+    download_handler.received_unhandled_entry =
+        onUnhandledEntry;
+
+    output.status("downloading");
+
+    mbl_mw_logging_download(
+        board,
+        255,
+        &download_handler
+    );
+
+    constexpr auto IDLE_TIMEOUT =
+        std::chrono::minutes(2);
+
+    auto last_progress_time =
+        std::chrono::steady_clock::now();
+
+    std::uint64_t last_samples_received =
+        totalSamplesReceived(
+            sync_state
+        );
+
+    std::uint32_t last_entries_left =
+        sync_state.entries_left.load();
+
+    std::uint32_t last_total_entries =
+        sync_state.total_entries.load();
+
+    int transfer_error_code = 0;
+    std::string transfer_error_id;
+    std::string transfer_error_message;
+
+    while (!sync_state.download_done.load()) {
+        bridge.pumpOnce(10);
+
+        const auto now =
+            std::chrono::steady_clock::now();
+
+        if (sync_state.writer_failed.load()) {
+            transfer_error_code = 6;
+            transfer_error_id =
+                "csv_writer_failed";
+            transfer_error_message =
+                writerError(sync_state);
+            break;
+        }
+
+        const std::uint64_t current_samples_received =
+            totalSamplesReceived(
+                sync_state
+            );
+
+        const std::uint32_t current_entries_left =
+            sync_state.entries_left.load();
+
+        const std::uint32_t current_total_entries =
+            sync_state.total_entries.load();
+
+        const bool samples_changed =
+            current_samples_received !=
+            last_samples_received;
+
+        const bool progress_changed =
+            current_entries_left !=
+                last_entries_left ||
+            current_total_entries !=
+                last_total_entries;
+
+        if (
+            samples_changed ||
+            progress_changed
+        ) {
+            last_progress_time = now;
+
+            last_samples_received =
+                current_samples_received;
+
+            last_entries_left =
+                current_entries_left;
+
+            last_total_entries =
+                current_total_entries;
+        }
+
+        if (
+            sync_state.download_started.load() &&
+            now - last_progress_time >
+                IDLE_TIMEOUT
+        ) {
+            transfer_error_code = 5;
+            transfer_error_id =
+                "download_stalled";
+            transfer_error_message =
+                "No download progress for 2 minutes";
+            break;
+        }
+
+        if (
+            !sync_state.download_started.load() &&
+            now - last_progress_time >
+                IDLE_TIMEOUT
+        ) {
+            transfer_error_code = 5;
+            transfer_error_id =
+                "download_not_started";
+            transfer_error_message =
+                "Download did not start within 2 minutes";
+            break;
+        }
+    }
+
+    output.status("finalizing_output");
+
+    finishWriter(
+        sync_state,
+        writer_thread
+    );
+
+    closeCsvs(
+        sync_state
+    );
+
+    if (transfer_error_code != 0) {
+        output.event(
+            "error",
+            {
+                {"code", transfer_error_id},
+                {"message", transfer_error_message},
+                {
+                    "imu_samples_received",
+                    sync_state.imu_samples_received.load()
+                },
+                {
+                    "battery_samples_received",
+                    sync_state.battery_samples_received.load()
+                },
+                {
+                    "entries_left",
+                    static_cast<std::uint64_t>(
+                        sync_state.entries_left.load()
+                    )
+                },
+                {
+                    "entries_total",
+                    static_cast<std::uint64_t>(
+                        sync_state.total_entries.load()
+                    )
+                },
+                {
+                    "unknown_entries",
+                    sync_state.unknown_entries.load()
+                },
+                {
+                    "unhandled_entries",
+                    sync_state.unhandled_entries.load()
+                }
+            }
+        );
+        output.completed(false, transfer_error_code);
+        return transfer_error_code;
+    }
+
+    if (sync_state.writer_failed.load()) {
+        output.error(
+            "csv_writer_failed",
+            writerError(sync_state)
+        );
+        output.completed(false, 6);
+        return 6;
+    }
+
+    if (CLEAR_AFTER_SUCCESSFUL_SYNC) {
+        output.status("clearing_downloaded_logs");
+
+        mbl_mw_logging_clear_entries(
+            board
+        );
+
         pumpFor(
             bridge,
             2000
         );
-
-        /*
-         * Subscribe directly to the anonymous logger routes discovered from the
-         * board.  There are no saved logger IDs in the stateless sync path.
-         */
-        std::cout
-            << "Subscribing anonymous accelerometer logger\n";
-
-        mbl_mw_anonymous_datasignal_subscribe(
-            accel_signal,
-            &sync_state,
-            onAccelLoggerData
-        );
-
-        std::cout
-            << "Subscribing anonymous gyro logger\n";
-
-        mbl_mw_anonymous_datasignal_subscribe(
-            gyro_signal,
-            &sync_state,
-            onGyroLoggerData
-        );
-
-        if (battery_enabled) {
-            std::cout
-                << "Subscribing anonymous battery logger\n";
-
-            mbl_mw_anonymous_datasignal_subscribe(
-                battery_signal,
-                &sync_state,
-                onBatteryLoggerData
-            );
-        }
-
-        download_handler.context =
-            &sync_state;
-
-        download_handler.received_progress_update =
-            onProgressUpdate;
-
-        download_handler.received_unknown_entry =
-            onUnknownEntry;
-
-        download_handler.received_unhandled_entry =
-            onUnhandledEntry;
-
-        std::cout
-            << "Starting log download\n";
-
-        mbl_mw_logging_download(
-            board,
-            255,
-            &download_handler
-        );
-
-        constexpr auto IDLE_TIMEOUT =
-            std::chrono::minutes(2);
-
-        constexpr auto PROGRESS_PRINT_INTERVAL =
-            std::chrono::milliseconds(1000);
-
-        auto last_progress_time =
-            std::chrono::steady_clock::now();
-
-        auto last_progress_print_time =
-            std::chrono::steady_clock::now();
-
-        bool printed_progress_line = false;
-
-        std::uint64_t last_rows_written =
-            totalRowsWritten(sync_state);
-
-        std::uint32_t last_entries_left =
-            sync_state.entries_left.load();
-
-        std::uint32_t last_total_entries =
-            sync_state.total_entries.load();
-
-        while (!sync_state.download_done.load()) {
-            bridge.pumpOnce(10);
-
-            const auto now =
-                std::chrono::steady_clock::now();
-
-            const std::uint64_t current_rows_written =
-                totalRowsWritten(sync_state);
-
-            const std::uint32_t current_entries_left =
-                sync_state.entries_left.load();
-
-            const std::uint32_t current_total_entries =
-                sync_state.total_entries.load();
-
-            const bool rows_changed =
-                current_rows_written !=
-                last_rows_written;
-
-            const bool progress_changed =
-                current_entries_left !=
-                last_entries_left ||
-                current_total_entries !=
-                last_total_entries;
-
-            /*
-             * Only treat entries_left == 0 as final progress after the SDK has
-             * reported a real nonzero total.  Otherwise the default 0/0 startup
-             * state would look like a completed transfer.
-             */
-            const bool sdk_has_progress_total =
-                current_total_entries > 0;
-
-            const bool sdk_reports_done =
-                sdk_has_progress_total &&
-                current_entries_left == 0;
-
-            const bool should_print_progress =
-                sync_state.download_started.load() &&
-                (
-                    now - last_progress_print_time >=
-                    PROGRESS_PRINT_INTERVAL ||
-                    sdk_reports_done
-                    );
-
-            if (should_print_progress) {
-                const std::uint64_t imu_rows =
-                    sync_state.imu_rows_written.load();
-
-                const std::uint64_t battery_rows =
-                    sync_state.battery_rows_written.load();
-
-                const std::uint64_t total_rows =
-                    imu_rows +
-                    battery_rows;
-
-                std::cout
-                    << "\r\033[K";
-
-                std::cout
-                    << "Download: "
-                    << total_rows
-                    << " rows"
-                    << " (IMU="
-                    << imu_rows
-                    << ", battery="
-                    << battery_rows
-                    << ")";
-
-                if (
-                    sdk_has_progress_total &&
-                    current_total_entries >=
-                    current_entries_left
-                    ) {
-                    const std::uint32_t entries_downloaded =
-                        current_total_entries -
-                        current_entries_left;
-
-                    const double sdk_percent =
-                        (
-                            static_cast<double>(
-                                entries_downloaded
-                                ) *
-                            100.0
-                            ) /
-                        static_cast<double>(
-                            current_total_entries
-                            );
-
-                    std::cout
-                        << " | SDK: "
-                        << std::fixed
-                        << std::setprecision(2)
-                        << sdk_percent
-                        << "% "
-                        << "("
-                        << entries_downloaded
-                        << "/"
-                        << current_total_entries
-                        << " entries)";
-                }
-                else {
-                    std::cout
-                        << " | SDK: waiting for total entry count";
-                }
-
-                std::cout
-                    << std::flush;
-
-                printed_progress_line = true;
-                last_progress_print_time = now;
-            }
-
-            if (
-                rows_changed ||
-                progress_changed
-                ) {
-                last_progress_time = now;
-
-                last_rows_written =
-                    current_rows_written;
-
-                last_entries_left =
-                    current_entries_left;
-
-                last_total_entries =
-                    current_total_entries;
-            }
-
-            if (
-                sync_state.download_started.load() &&
-                now - last_progress_time >
-                IDLE_TIMEOUT
-                ) {
-                if (printed_progress_line) {
-                    std::cout << "\n";
-                    printed_progress_line = false;
-                }
-
-                std::cerr
-                    << "Sync timed out: no download progress for 2 minutes.\n";
-
-                std::cerr
-                    << "IMU rows written so far: "
-                    << sync_state.imu_rows_written.load()
-                    << "\n";
-
-                std::cerr
-                    << "Battery rows written so far: "
-                    << sync_state.battery_rows_written.load()
-                    << "\n";
-
-                std::cerr
-                    << "Entries left: "
-                    << sync_state.entries_left.load()
-                    << " / "
-                    << sync_state.total_entries.load()
-                    << "\n";
-
-                std::cerr
-                    << "Unknown entries: "
-                    << sync_state.unknown_entries.load()
-                    << "\n";
-
-                std::cerr
-                    << "Unhandled entries: "
-                    << sync_state.unhandled_entries.load()
-                    << "\n";
-
-                std::cerr
-                    << "Output directory: "
-                    << output_dir
-                    << "\n";
-
-                closeCsvs(
-                    sync_state,
-                    battery_enabled
-                );
-
-                return 5;
-            }
-
-            if (
-                !sync_state.download_started.load() &&
-                now - last_progress_time >
-                IDLE_TIMEOUT
-                ) {
-                if (printed_progress_line) {
-                    std::cout << "\n";
-                    printed_progress_line = false;
-                }
-
-                std::cerr
-                    << "Sync timed out: download did not start within 2 minutes.\n";
-
-                std::cerr
-                    << "IMU rows written so far: "
-                    << sync_state.imu_rows_written.load()
-                    << "\n";
-
-                std::cerr
-                    << "Battery rows written so far: "
-                    << sync_state.battery_rows_written.load()
-                    << "\n";
-
-                std::cerr
-                    << "Output directory: "
-                    << output_dir
-                    << "\n";
-
-                closeCsvs(
-                    sync_state,
-                    battery_enabled
-                );
-
-                return 5;
-            }
-
-            std::this_thread::sleep_for(
-                1ms
-            );
-        }
-
-        if (!finalizeXsensCsv(
-            sync_state,
-            csv_paths
-        )) {
-            closeCsvs(
-                sync_state,
-                battery_enabled
-            );
-
-            return 6;
-        }
-
-        closeCsvs(
-            sync_state,
-            battery_enabled
-        );
-
-        if (printed_progress_line) {
-            std::cout << "\n";
-        }
-
-        if (CLEAR_AFTER_SUCCESSFUL_SYNC) {
-            std::cout
-                << "Clearing downloaded log entries\n";
-
-            mbl_mw_logging_clear_entries(
-                board
-            );
-
-            pumpFor(
-                bridge,
-                2000
-            );
-        }
-
-        std::cout
-            << "Sync complete.\n";
-
-        std::cout
-            << "IMU rows written: "
-            << sync_state.imu_rows_written.load()
-            << "\n";
-
-        std::cout
-            << "Xsens-compatible rows written: "
-            << sync_state.xsens_rows_written.load()
-            << "\n";
-
-        std::cout
-            << "Unmatched accel samples: "
-            << sync_state.xsens_unmatched_accel
-            << "\n";
-
-        std::cout
-            << "Unmatched gyro samples: "
-            << sync_state.xsens_unmatched_gyro
-            << "\n";
-
-        if (battery_enabled) {
-            std::cout
-                << "Battery rows written: "
-                << sync_state.battery_rows_written.load()
-                << "\n";
-        }
-
-        std::cout
-            << "Unknown entries: "
-            << sync_state.unknown_entries.load()
-            << "\n";
-
-        std::cout
-            << "Unhandled entries: "
-            << sync_state.unhandled_entries.load()
-            << "\n";
-
-        std::cout
-            << "IMU CSV: "
-            << imu_path
-            << "\n";
-
-        std::cout
-            << "Xsens-compatible CSV: "
-            << xsens_path
-            << "\n";
-
-        if (battery_enabled) {
-            std::cout
-                << "Battery CSV: "
-                << battery_path
-                << "\n";
-        }
-
-        return 0;
     }
+
+    output.event(
+        "summary",
+        {
+            {
+                "imu_samples_received",
+                sync_state.imu_samples_received.load()
+            },
+            {
+                "xsens_rows_written",
+                sync_state.xsens_rows_written.load()
+            },
+            {
+                "unmatched_accel_samples",
+                sync_state.xsens_unmatched_accel
+            },
+            {
+                "unmatched_gyro_samples",
+                sync_state.xsens_unmatched_gyro
+            },
+            {
+                "legacy_imu_rows_written",
+                sync_state.imu_rows_written.load()
+            },
+            {
+                "battery_rows_written",
+                sync_state.battery_rows_written.load()
+            },
+            {
+                "unknown_entries",
+                sync_state.unknown_entries.load()
+            },
+            {
+                "unhandled_entries",
+                sync_state.unhandled_entries.load()
+            }
+        }
+    );
+
+    output.completed(true, 0);
+    return 0;
+}
+
+/*
+ * Xsens-only overload for callers that provide their own per-operation sink.
+ */
+int runSyncCommand(
+    const std::string& port_name,
+    const std::string& output_path,
+    CommandOutput& output,
+    SyncProgressCallback progress_callback
+) {
+    return runSyncCommand(
+        port_name,
+        output_path,
+        false,
+        output,
+        std::move(progress_callback)
+    );
+}
+
+/*
+ * Compatibility overload used by existing CLI callers.
+ * JSONL is written to stdout, but no global stream redirection is performed.
+ */
+int runSyncCommand(
+    const std::string& port_name,
+    const std::string& output_path,
+    bool write_imu_csv,
+    SyncProgressCallback progress_callback
+) {
+    CommandOutput output("sync");
+
+    return runSyncCommand(
+        port_name,
+        output_path,
+        write_imu_csv,
+        output,
+        std::move(progress_callback)
+    );
+}
+
+/*
+ * Backward-compatible Xsens-only entry point used by the current GUI.
+ */
+int runSyncCommand(
+    const std::string& port_name,
+    const std::string& output_path,
+    SyncProgressCallback progress_callback
+) {
+    CommandOutput output("sync");
+
+    return runSyncCommand(
+        port_name,
+        output_path,
+        false,
+        output,
+        std::move(progress_callback)
+    );
+}
 
 } // namespace headmotion::app

@@ -1,3 +1,4 @@
+#include "headmotion/app/CommandOutput.hpp"
 #include "headmotion/metawear/MetaWearUsbTransport.hpp"
 #include "headmotion/sdk/MetaWearSdkBridge.hpp"
 #include "headmotion/session/BoardStateStore.hpp"
@@ -5,38 +6,28 @@
 #include "headmotion/transport/SerialPortFactory.hpp"
 
 #include <chrono>
-#include <iostream>
 #include <string>
 
 namespace headmotion::app {
 
 int runSdkProbeCommand(
-    const std::string& port_name
+    const std::string& port_name,
+    CommandOutput& output
 ) {
     using namespace std::chrono_literals;
 
-    /*
-     * Resolve the physical MMS+ identity.
-     *
-     * This uses the USB serial when available, or the Linux
-     * /dev/serial/by-id path fallback we added earlier.
-     */
     const std::string device_id =
         headmotion::session::BoardStateStore::
             deviceIdForPort(port_name);
 
-    std::cout
-        << "MMS+ device ID: "
-        << device_id
-        << "\n";
-
-    std::cout
-        << "Current port: "
-        << port_name
-        << "\n";
+    output.started(
+        {
+            {"port", port_name},
+            {"device_id", device_id}
+        }
+    );
 
     headmotion::transport::SerialConfig config;
-
     config.port_name = port_name;
     config.baud_rate = 115200;
     config.data_bits = 8;
@@ -44,6 +35,8 @@ int runSdkProbeCommand(
     config.assert_dtr = true;
     config.assert_rts = true;
     config.open_delay = 100ms;
+
+    output.status("opening_port");
 
     auto serial =
         headmotion::transport::SerialPortFactory::
@@ -53,48 +46,51 @@ int runSdkProbeCommand(
         *serial
     );
 
-    std::cout
-        << "Opening "
-        << port_name
-        << "\n";
-
     usb.open();
 
     headmotion::sdk::MetaWearSdkBridge bridge(
         usb
     );
 
-    std::cout
-        << "Initializing MetaWear SDK board\n";
+    output.status("initializing_sdk");
 
     const bool ok =
         bridge.initialize(5000);
 
-    std::cout
-        << "SDK probe initialized="
-        << (ok ? "true" : "false")
-        << " status="
-        << bridge.initializeStatus()
-        << "\n";
+    output.event(
+        "sdk_probe",
+        {
+            {"initialized", ok},
+            {
+                "status",
+                bridge.initializeStatus()
+            }
+        }
+    );
 
     if (!ok) {
-        std::cerr
-            << "SDK probe failed for MMS+ "
-            << device_id
-            << "\n";
+        output.error(
+            "sdk_probe_failed",
+            "SDK probe failed"
+        );
 
+        output.completed(false, 2);
         return 2;
     }
 
-    std::cout
-        << "SDK probe successful.\n";
-
-    std::cout
-        << "Device ID: "
-        << device_id
-        << "\n";
-
+    output.completed(true, 0);
     return 0;
+}
+
+int runSdkProbeCommand(
+    const std::string& port_name
+) {
+    CommandOutput output("sdk-probe");
+
+    return runSdkProbeCommand(
+        port_name,
+        output
+    );
 }
 
 } // namespace headmotion::app

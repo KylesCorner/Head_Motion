@@ -212,7 +212,7 @@ void MetaWearSdkBridge::handleWriteGattChar(
      * instead of relying on terminal/debug logging to slow the loop down.
      */
     constexpr auto MIN_WRITE_SPACING =
-        std::chrono::microseconds(600);
+        std::chrono::microseconds(300);
 
     const auto now = std::chrono::steady_clock::now();
         if (last_write_time_ != std::chrono::steady_clock::time_point{}) {

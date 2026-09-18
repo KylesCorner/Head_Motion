@@ -1,3 +1,4 @@
+#include "headmotion/app/CommandOutput.hpp"
 #include "headmotion/metawear/MetaWearUsbTransport.hpp"
 #include "headmotion/session/BoardStateStore.hpp"
 #include "headmotion/transport/SerialConfig.hpp"
@@ -6,39 +7,29 @@
 
 #include <chrono>
 #include <cstdint>
-#include <iostream>
 #include <string>
 #include <vector>
 
 namespace headmotion::app {
 
 int runModuleInfoCommand(
-    const std::string& port_name
+    const std::string& port_name,
+    CommandOutput& output
 ) {
     using namespace std::chrono_literals;
 
-    /*
-     * Resolve the physical MMS+ identity from the current serial port.
-     *
-     * This uses the USB serial number when available and the Linux
-     * /dev/serial/by-id fallback otherwise.
-     */
     const std::string device_id =
         headmotion::session::BoardStateStore::
             deviceIdForPort(port_name);
 
-    std::cout
-        << "MMS+ device ID: "
-        << device_id
-        << "\n";
-
-    std::cout
-        << "Current port: "
-        << port_name
-        << "\n";
+    output.started(
+        {
+            {"port", port_name},
+            {"device_id", device_id}
+        }
+    );
 
     headmotion::transport::SerialConfig config;
-
     config.port_name = port_name;
     config.baud_rate = 115200;
     config.data_bits = 8;
@@ -46,6 +37,8 @@ int runModuleInfoCommand(
     config.assert_dtr = true;
     config.assert_rts = true;
     config.open_delay = 100ms;
+
+    output.status("opening_port");
 
     auto serial =
         headmotion::transport::SerialPortFactory::
@@ -55,24 +48,25 @@ int runModuleInfoCommand(
         *serial
     );
 
-    std::cout
-        << "Opening "
-        << port_name
-        << "\n";
-
     usb.open();
 
-    const std::vector<std::uint8_t> module_info_payload = {
-        0x01,
-        0x80
-    };
+    const std::vector<std::uint8_t>
+        module_info_payload = {
+            0x01,
+            0x80
+        };
 
-    std::cout
-        << "Sending module-info payload: "
-        << headmotion::util::hexDump(
-            module_info_payload
-        )
-        << "\n";
+    output.event(
+        "tx",
+        {
+            {
+                "payload_hex",
+                headmotion::util::hexDump(
+                    module_info_payload
+                )
+            }
+        }
+    );
 
     const auto response =
         usb.transactPayload(
@@ -81,42 +75,55 @@ int runModuleInfoCommand(
         );
 
     if (response.empty()) {
-        std::cout
-            << "No module-info response received.\n";
+        output.error(
+            "no_module_info_response",
+            "No module-info response received"
+        );
 
-        std::cout
-            << "Device ID: "
-            << device_id
-            << "\n";
-
+        output.completed(false, 2);
         return 2;
     }
 
-    std::cout
-        << "Module-info response payload ["
-        << response.size()
-        << " bytes]: "
-        << headmotion::util::hexDump(response)
-        << "\n";
-
-    if (
+    const bool shape_ok =
         response.size() >= 4 &&
         response[0] == 0x01 &&
-        response[1] == 0x80
-    ) {
-        std::cout
-            << "Module-info round trip OK.\n";
-    } else {
-        std::cout
-            << "Unexpected module-info response shape.\n";
-    }
+        response[1] == 0x80;
 
-    std::cout
-        << "Device ID: "
-        << device_id
-        << "\n";
+    output.event(
+        "module_info",
+        {
+            {
+                "bytes",
+                static_cast<std::uint64_t>(
+                    response.size()
+                )
+            },
+            {
+                "payload_hex",
+                headmotion::util::hexDump(
+                    response
+                )
+            },
+            {
+                "expected_shape",
+                shape_ok
+            }
+        }
+    );
 
+    output.completed(true, 0);
     return 0;
+}
+
+int runModuleInfoCommand(
+    const std::string& port_name
+) {
+    CommandOutput output("module-info");
+
+    return runModuleInfoCommand(
+        port_name,
+        output
+    );
 }
 
 } // namespace headmotion::app

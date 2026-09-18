@@ -95,3 +95,4 @@ build/*/ninja_deps
 # Generated documentation
 docs/_build/
 external/
+.lca/

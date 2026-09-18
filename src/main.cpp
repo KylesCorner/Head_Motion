@@ -43,6 +43,7 @@ namespace {
     struct SyncArguments {
         CommonArguments common;
         std::string output_path = "data/sync";
+        bool write_imu_csv = false;
     };
 
     struct PortAndPayloadArguments {
@@ -472,6 +473,7 @@ namespace {
             << "  " << argv0
             << " sync [device selector]"
             << " [--out <directory> | --output-dir <directory>]"
+            << " [--imu-csv]"
             << " [output options]\n"
 
             << "  " << argv0
@@ -481,6 +483,10 @@ namespace {
             << "Device selector (choose at most one):\n"
             << "  --port <serial-port>\n"
             << "  --device-id <board-serial>\n"
+
+            << "\n"
+            << "Sync options:\n"
+            << "  --imu-csv  also write the legacy long-format imu.csv\n"
 
             << "\n"
             << "Output options:\n"
@@ -851,6 +857,12 @@ namespace {
 
             const std::string option =
                 argv[index];
+
+            if (option == "--imu-csv") {
+                arguments.write_imu_csv = true;
+                ++index;
+                continue;
+            }
 
             if (
                 option == "--out" ||
@@ -1340,6 +1352,7 @@ int main(
                             runSyncCommand(
                                 port,
                                 arguments.output_path,
+                                arguments.write_imu_csv,
                                 [
                                     json =
                                         arguments.common.json,
@@ -1382,7 +1395,7 @@ int main(
                                             original_cout
                                         );
                                 }
-                                        );
+                            );
                     }
                 );
 

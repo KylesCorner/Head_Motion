@@ -1,3 +1,4 @@
+#include "headmotion/app/CommandOutput.hpp"
 #include "headmotion/session/BoardStateStore.hpp"
 #include "headmotion/transport/SerialConfig.hpp"
 #include "headmotion/transport/SerialPortFactory.hpp"
@@ -5,7 +6,6 @@
 
 #include <chrono>
 #include <cstdint>
-#include <iostream>
 #include <string>
 #include <vector>
 
@@ -13,15 +13,23 @@ namespace headmotion::app {
 
 int runRawTxCommand(
     const std::string& port_name,
-    const std::string& hex_string
+    const std::string& hex_string,
+    CommandOutput& output
 ) {
     using namespace std::chrono_literals;
 
     const auto tx =
-        headmotion::util::parseHexBytes(hex_string);
+        headmotion::util::parseHexBytes(
+            hex_string
+        );
 
     if (tx.empty()) {
-        std::cerr << "No bytes to send.\n";
+        output.error(
+            "empty_tx",
+            "No bytes to send"
+        );
+
+        output.completed(false, 1);
         return 1;
     }
 
@@ -29,18 +37,14 @@ int runRawTxCommand(
         headmotion::session::BoardStateStore::
             deviceIdForPort(port_name);
 
-    std::cout
-        << "MMS+ device ID: "
-        << device_id
-        << "\n";
-
-    std::cout
-        << "Current port: "
-        << port_name
-        << "\n";
+    output.started(
+        {
+            {"port", port_name},
+            {"device_id", device_id}
+        }
+    );
 
     headmotion::transport::SerialConfig config;
-
     config.port_name = port_name;
     config.baud_rate = 115200;
     config.data_bits = 8;
@@ -49,23 +53,29 @@ int runRawTxCommand(
     config.assert_rts = true;
     config.open_delay = 100ms;
 
+    output.status("opening_port");
+
     auto port =
         headmotion::transport::SerialPortFactory::
-            create(config);
-
-    std::cout
-        << "Opening "
-        << port_name
-        << "\n";
+        create(config);
 
     port->open();
 
-    std::cout
-        << "TX ["
-        << tx.size()
-        << " bytes]: "
-        << headmotion::util::hexDump(tx)
-        << "\n";
+    output.event(
+        "tx",
+        {
+            {
+                "bytes",
+                static_cast<std::uint64_t>(
+                    tx.size()
+                )
+            },
+            {
+                "hex",
+                headmotion::util::hexDump(tx)
+            }
+        }
+    );
 
     port->write(tx);
 
@@ -95,34 +105,50 @@ int runRawTxCommand(
     }
 
     if (rx.empty()) {
-        std::cout
-            << "RX: no response\n";
+        output.error(
+            "no_response",
+            "No response received"
+        );
 
+        output.completed(false, 2);
         return 2;
     }
 
-    std::cout
-        << "RX ["
-        << rx.size()
-        << " bytes] hex:\n";
+    output.event(
+        "rx",
+        {
+            {
+                "bytes",
+                static_cast<std::uint64_t>(
+                    rx.size()
+                )
+            },
+            {
+                "hex",
+                headmotion::util::hexDump(rx)
+            },
+            {
+                "ascii",
+                headmotion::util::asciiPreview(rx)
+            }
+        }
+    );
 
-    std::cout
-        << headmotion::util::hexDump(rx)
-        << "\n";
-
-    std::cout
-        << "RX ASCII preview:\n";
-
-    std::cout
-        << headmotion::util::asciiPreview(rx)
-        << "\n";
-
-    std::cout
-        << "Raw TX complete for device "
-        << device_id
-        << ".\n";
-
+    output.completed(true, 0);
     return 0;
+}
+
+int runRawTxCommand(
+    const std::string& port_name,
+    const std::string& hex_string
+) {
+    CommandOutput output("tx-raw");
+
+    return runRawTxCommand(
+        port_name,
+        hex_string,
+        output
+    );
 }
 
 } // namespace headmotion::app

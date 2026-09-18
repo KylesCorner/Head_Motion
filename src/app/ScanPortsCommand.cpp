@@ -1,9 +1,8 @@
+#include "headmotion/app/CommandOutput.hpp"
 #include "headmotion/app/MmsDeviceProbe.hpp"
 #include "headmotion/transport/SerialPortFactory.hpp"
 
 #include <cstdint>
-#include <iomanip>
-#include <iostream>
 #include <string>
 #include <vector>
 
@@ -35,29 +34,10 @@ namespace {
     std::string stableDeviceId(
         const headmotion::transport::SerialPortInfo& port
     ) {
-        /*
-         * Preferred source:
-         * USB serial metadata supplied by the serial-port backend.
-         *
-         * This works on Windows when the backend exposes the USB
-         * serial number.
-         */
         if (!port.serial_number.empty()) {
             return port.serial_number;
         }
 
-        /*
-         * Linux fallback.
-         *
-         * Example:
-         *
-         * /dev/serial/by-id/
-         * usb-MbientLab_MetaMotionS_D55AED28027D-if00
-         *
-         * Extract:
-         *
-         * D55AED28027D
-         */
         if (!port.symlink_path.empty()) {
             constexpr const char* marker =
                 "usb-MbientLab_MetaMotionS_";
@@ -67,7 +47,8 @@ namespace {
 
             if (begin != std::string::npos) {
                 const std::size_t serial_begin =
-                    begin + std::string(marker).size();
+                    begin +
+                    std::string(marker).size();
 
                 const std::size_t serial_end =
                     port.symlink_path.find(
@@ -78,7 +59,7 @@ namespace {
                 if (
                     serial_end != std::string::npos &&
                     serial_end > serial_begin
-                    ) {
+                ) {
                     return port.symlink_path.substr(
                         serial_begin,
                         serial_end - serial_begin
@@ -87,10 +68,6 @@ namespace {
             }
         }
 
-        /*
-         * A stable ID is useful, but it is no longer required for
-         * host-side state lookup because the application is stateless.
-         */
         return {};
     }
 
@@ -98,84 +75,95 @@ namespace {
 
 namespace headmotion::app {
 
-    int runScanPortsCommand() {
+    int runScanPortsCommand(
+        CommandOutput& output
+    ) {
+        output.started();
+
         const auto ports =
             headmotion::transport::SerialPortFactory::
             listPorts();
 
         if (ports.empty()) {
-            std::cerr
-                << "No serial ports found.\n";
+            output.error(
+                "no_serial_ports",
+                "No serial ports found"
+            );
+
+            output.completed(
+                false,
+                2
+            );
 
             return 2;
         }
 
+        output.event(
+            "scan_summary",
+            {
+                {
+                    "serial_ports_found",
+                    static_cast<std::uint64_t>(
+                        ports.size()
+                    )
+                }
+            }
+        );
+
         std::vector<VerifiedMms> verified_devices;
 
-        std::cout
-            << "Scanning serial ports:\n";
-
         for (const auto& port : ports) {
-            std::cout
-                << "  "
-                << port.path;
-
-            if (!port.symlink_path.empty()) {
-                std::cout
-                    << " via "
-                    << port.symlink_path;
-            }
-
-            if (
-                port.vendor_id != 0 ||
-                port.product_id != 0
-                ) {
-                std::cout
-                    << " [USB "
-                    << std::hex
-                    << std::setw(4)
-                    << std::setfill('0')
-                    << port.vendor_id
-                    << ":"
-                    << std::setw(4)
-                    << port.product_id
-                    << std::dec
-                    << std::setfill(' ')
-                    << "]";
-            }
-
-            if (!port.serial_number.empty()) {
-                std::cout
-                    << " serial="
-                    << port.serial_number;
-            }
-
             const bool candidate =
                 exactMmsUsbMatch(port) ||
                 port.likely_mms;
 
+            output.event(
+                "port",
+                {
+                    {"path", port.path},
+                    {
+                        "preferred_path",
+                        port.preferredPath()
+                    },
+                    {
+                        "symlink_path",
+                        port.symlink_path
+                    },
+                    {
+                        "serial_number",
+                        port.serial_number
+                    },
+                    {
+                        "vendor_id",
+                        port.vendor_id
+                    },
+                    {
+                        "product_id",
+                        port.product_id
+                    },
+                    {
+                        "candidate",
+                        candidate
+                    }
+                }
+            );
+
             if (!candidate) {
-                std::cout << "\n";
                 continue;
             }
 
-            std::cout
-                << " MMS candidate";
-
-            /*
-             * USB VID/PID alone is not enough.
-             *
-             * Verify that the device actually responds to the
-             * MetaMotionS protocol.
-             */
             const auto probe =
                 probeMmsDevice(
                     port.preferredPath()
                 );
 
             if (!probe) {
-                std::cout
-                    << " - protocol verification failed\n";
+                output.warning(
+                    "protocol_verification_failed",
+                    "MMS+ candidate did not respond to "
+                    "the MetaMotionS protocol on " +
+                    port.preferredPath()
+                );
 
                 continue;
             }
@@ -183,99 +171,85 @@ namespace headmotion::app {
             const std::string device_id =
                 stableDeviceId(port);
 
-            std::cout
-                << " - verified: "
-                << probe->identity;
+            output.event(
+                "device",
+                {
+                    {
+                        "device_id",
+                        device_id
+                    },
+                    {
+                        "port",
+                        port.preferredPath()
+                    },
+                    {
+                        "system_port",
+                        port.path
+                    },
+                    {
+                        "identity",
+                        probe->identity
+                    },
+                    {
+                        "vendor_id",
+                        port.vendor_id
+                    },
+                    {
+                        "product_id",
+                        port.product_id
+                    }
+                }
+            );
 
-            if (!device_id.empty()) {
-                std::cout
-                    << " device_id="
-                    << device_id;
-            }
-
-            std::cout
-                << "\n";
-
-            verified_devices.push_back({
-                .port = port,
-                .identity = probe->identity,
-                .device_id = device_id
-                });
+            verified_devices.push_back(
+                {
+                    .port = port,
+                    .identity = probe->identity,
+                    .device_id = device_id
+                }
+            );
         }
 
         if (verified_devices.empty()) {
-            std::cerr
-                << "No verified MMS+ devices found.\n";
+            output.error(
+                "no_verified_devices",
+                "No verified MMS+ devices found"
+            );
+
+            output.completed(
+                false,
+                3
+            );
 
             return 3;
         }
 
-        std::cout
-            << "\nVerified MMS+ devices: "
-            << verified_devices.size()
-            << "\n";
-
-        for (const auto& device : verified_devices) {
-            const auto& port =
-                device.port;
-
-            std::cout
-                << "\n";
-
-            if (!device.device_id.empty()) {
-                std::cout
-                    << "  Device ID: "
-                    << device.device_id
-                    << "\n";
+        output.event(
+            "summary",
+            {
+                {
+                    "verified_devices",
+                    static_cast<std::uint64_t>(
+                        verified_devices.size()
+                    )
+                }
             }
-            else {
-                std::cout
-                    << "  Device ID: unavailable\n";
-            }
+        );
 
-            std::cout
-                << "  Port: "
-                << port.preferredPath()
-                << "\n"
-                << "  System port: "
-                << port.path
-                << "\n"
-                << "  Identity: "
-                << device.identity
-                << "\n";
-
-            if (
-                port.vendor_id != 0 ||
-                port.product_id != 0
-                ) {
-                std::cout
-                    << "  USB VID:PID: "
-                    << std::hex
-                    << std::setw(4)
-                    << std::setfill('0')
-                    << port.vendor_id
-                    << ":"
-                    << std::setw(4)
-                    << port.product_id
-                    << std::dec
-                    << std::setfill(' ')
-                    << "\n";
-            }
-        }
-
-        std::cout
-            << "\nScan complete. Found "
-            << verified_devices.size()
-            << " MMS+ device";
-
-        if (verified_devices.size() != 1) {
-            std::cout << "s";
-        }
-
-        std::cout
-            << ".\n";
+        output.completed(
+            true,
+            0
+        );
 
         return 0;
+    }
+
+    int runScanPortsCommand() {
+        CommandOutput output("scan");
+
+        return runScanPortsCommand(
+            output
+        );
     }
 
 } // namespace headmotion::app

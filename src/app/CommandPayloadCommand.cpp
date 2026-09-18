@@ -1,3 +1,4 @@
+#include "headmotion/app/CommandOutput.hpp"
 #include "headmotion/protocol/UsbFrameCodec.hpp"
 #include "headmotion/session/BoardStateStore.hpp"
 #include "headmotion/transport/SerialConfig.hpp"
@@ -6,7 +7,6 @@
 
 #include <chrono>
 #include <cstdint>
-#include <iostream>
 #include <string>
 #include <vector>
 
@@ -14,7 +14,8 @@ namespace headmotion::app {
 
 int runCommandPayloadCommand(
     const std::string& port_name,
-    const std::string& payload_hex
+    const std::string& payload_hex,
+    CommandOutput& output
 ) {
     using namespace std::chrono_literals;
 
@@ -24,9 +25,12 @@ int runCommandPayloadCommand(
         );
 
     if (payload.empty()) {
-        std::cerr
-            << "No payload bytes to send.\n";
+        output.error(
+            "empty_payload",
+            "No payload bytes to send"
+        );
 
+        output.completed(false, 1);
         return 1;
     }
 
@@ -34,25 +38,18 @@ int runCommandPayloadCommand(
         headmotion::protocol::UsbFrameCodec::
             encodePayload(payload);
 
-    /*
-     * Resolve the physical MMS+ identity from the current serial port.
-     */
     const std::string device_id =
         headmotion::session::BoardStateStore::
             deviceIdForPort(port_name);
 
-    std::cout
-        << "MMS+ device ID: "
-        << device_id
-        << "\n";
-
-    std::cout
-        << "Current port: "
-        << port_name
-        << "\n";
+    output.started(
+        {
+            {"port", port_name},
+            {"device_id", device_id}
+        }
+    );
 
     headmotion::transport::SerialConfig config;
-
     config.port_name = port_name;
     config.baud_rate = 115200;
     config.data_bits = 8;
@@ -61,30 +58,41 @@ int runCommandPayloadCommand(
     config.assert_rts = true;
     config.open_delay = 100ms;
 
+    output.status("opening_port");
+
     auto port =
         headmotion::transport::SerialPortFactory::
             create(config);
 
-    std::cout
-        << "Opening "
-        << port_name
-        << "\n";
-
     port->open();
 
-    std::cout
-        << "Payload TX ["
-        << payload.size()
-        << " bytes]: "
-        << headmotion::util::hexDump(payload)
-        << "\n";
-
-    std::cout
-        << "Framed TX ["
-        << tx.size()
-        << " bytes]: "
-        << headmotion::util::hexDump(tx)
-        << "\n";
+    output.event(
+        "tx",
+        {
+            {
+                "payload_bytes",
+                static_cast<std::uint64_t>(
+                    payload.size()
+                )
+            },
+            {
+                "payload_hex",
+                headmotion::util::hexDump(
+                    payload
+                )
+            },
+            {
+                "frame_bytes",
+                static_cast<std::uint64_t>(
+                    tx.size()
+                )
+            },
+            {
+                "frame_hex",
+                headmotion::util::hexDump(tx)
+            }
+        }
+    );
 
     port->write(tx);
 
@@ -114,65 +122,90 @@ int runCommandPayloadCommand(
     }
 
     if (rx.empty()) {
-        std::cout
-            << "RX: no response\n";
+        output.error(
+            "no_response",
+            "No response received"
+        );
 
-        std::cout
-            << "Device ID: "
-            << device_id
-            << "\n";
-
+        output.completed(false, 2);
         return 2;
     }
 
-    std::cout
-        << "Raw RX ["
-        << rx.size()
-        << " bytes]:\n";
-
-    std::cout
-        << headmotion::util::hexDump(rx)
-        << "\n";
+    output.event(
+        "raw_rx",
+        {
+            {
+                "bytes",
+                static_cast<std::uint64_t>(
+                    rx.size()
+                )
+            },
+            {
+                "hex",
+                headmotion::util::hexDump(rx)
+            }
+        }
+    );
 
     const auto frames =
         headmotion::protocol::UsbFrameCodec::
             decodeFrames(rx);
-
-    if (frames.empty()) {
-        std::cout
-            << "No decoded USB frames.\n";
-
-        std::cout
-            << "Device ID: "
-            << device_id
-            << "\n";
-
-        return 0;
-    }
 
     for (
         std::size_t i = 0;
         i < frames.size();
         ++i
     ) {
-        std::cout
-            << "Frame "
-            << i
-            << " payload ["
-            << frames[i].payload.size()
-            << " bytes]: "
-            << headmotion::util::hexDump(
-                frames[i].payload
-            )
-            << "\n";
+        output.event(
+            "frame",
+            {
+                {
+                    "index",
+                    static_cast<std::uint64_t>(i)
+                },
+                {
+                    "payload_bytes",
+                    static_cast<std::uint64_t>(
+                        frames[i].payload.size()
+                    )
+                },
+                {
+                    "payload_hex",
+                    headmotion::util::hexDump(
+                        frames[i].payload
+                    )
+                }
+            }
+        );
     }
 
-    std::cout
-        << "Command payload complete for device "
-        << device_id
-        << ".\n";
+    output.event(
+        "summary",
+        {
+            {
+                "decoded_frames",
+                static_cast<std::uint64_t>(
+                    frames.size()
+                )
+            }
+        }
+    );
 
+    output.completed(true, 0);
     return 0;
+}
+
+int runCommandPayloadCommand(
+    const std::string& port_name,
+    const std::string& payload_hex
+) {
+    CommandOutput output("cmd");
+
+    return runCommandPayloadCommand(
+        port_name,
+        payload_hex,
+        output
+    );
 }
 
 } // namespace headmotion::app
