@@ -533,10 +533,536 @@ endif()
 # ============================================================
 
 if(HEADMOTION_BUILD_TESTS)
+
     enable_testing()
 
-    # Tests can be added here later.
+    find_package(
+        Threads REQUIRED
+    )
+
+
+    # ========================================================
+    # Common test helper
+    # ========================================================
+    #
+    # Usage:
+    #
+    #   headmotion_add_test_target(
+    #       <target>
+    #       <source>
+    #       <ctest-name>
+    #
+    #       [EXTRA_SOURCES ...]
+    #       [LIBRARIES ...]
+    #       [LABELS ...]
+    #       [TIMEOUT <seconds>]
+    #       [SKIP_RETURN_77]
+    #       [RUN_SERIAL]
+    #   )
+    #
+    # Every HeadMotion test:
+    #   - includes project headers
+    #   - uses C++20
+    #   - is registered with CTest
+    #
+    # Individual tests only specify what differs.
+    # ========================================================
+
+    function(
+        headmotion_add_test_target
+        TARGET_NAME
+        SOURCE_FILE
+        TEST_NAME
+    )
+
+        set(
+            options
+                SKIP_RETURN_77
+                RUN_SERIAL
+        )
+
+        set(
+            one_value_args
+                TIMEOUT
+        )
+
+        set(
+            multi_value_args
+                EXTRA_SOURCES
+                LIBRARIES
+                LABELS
+        )
+
+        cmake_parse_arguments(
+            TEST
+            "${options}"
+            "${one_value_args}"
+            "${multi_value_args}"
+            ${ARGN}
+        )
+
+
+        add_executable(
+            ${TARGET_NAME}
+            ${SOURCE_FILE}
+            ${TEST_EXTRA_SOURCES}
+        )
+
+
+        target_include_directories(
+            ${TARGET_NAME}
+            PRIVATE
+                include
+        )
+
+
+        target_compile_features(
+            ${TARGET_NAME}
+            PRIVATE
+                cxx_std_20
+        )
+
+
+        if(TEST_LIBRARIES)
+
+            target_link_libraries(
+                ${TARGET_NAME}
+                PRIVATE
+                    ${TEST_LIBRARIES}
+            )
+
+        endif()
+
+
+        add_test(
+            NAME
+                ${TEST_NAME}
+            COMMAND
+                ${TARGET_NAME}
+        )
+
+
+        if(TEST_LABELS)
+
+            set_property(
+                TEST
+                    ${TEST_NAME}
+                PROPERTY
+                    LABELS
+                    ${TEST_LABELS}
+            )
+
+        endif()
+
+
+        if(TEST_TIMEOUT)
+
+            set_property(
+                TEST
+                    ${TEST_NAME}
+                PROPERTY
+                    TIMEOUT
+                    ${TEST_TIMEOUT}
+            )
+
+        endif()
+
+
+        if(TEST_SKIP_RETURN_77)
+
+            set_property(
+                TEST
+                    ${TEST_NAME}
+                PROPERTY
+                    SKIP_RETURN_CODE
+                    77
+            )
+
+        endif()
+
+
+        if(TEST_RUN_SERIAL)
+
+            set_property(
+                TEST
+                    ${TEST_NAME}
+                PROPERTY
+                    RUN_SERIAL
+                    TRUE
+            )
+
+        endif()
+
+    endfunction()
+
+
+    # ========================================================
+    # White-box SyncCommand tests
+    # ========================================================
+    #
+    # These tests include SyncCommand.cpp directly so they can
+    # exercise its anonymous-namespace/private data-path helpers.
+    #
+    # MmsDeviceProbe.cpp must therefore also be compiled into
+    # each test to satisfy symbols referenced by SyncCommand.cpp.
+    # ========================================================
+
+    set(
+        HEADMOTION_SYNC_TEST_LIBRARIES
+
+        headmotion_core
+        headmotion_session
+        headmotion_transport
+        headmotion_platform_serial
+        headmotion_protocol
+        headmotion_metawear_usb
+        headmotion_sdk_bridge
+        Threads::Threads
+    )
+
+
+    function(
+        headmotion_add_sync_test
+        TARGET_NAME
+        SOURCE_FILE
+        TEST_NAME
+    )
+
+        headmotion_add_test_target(
+            ${TARGET_NAME}
+            ${SOURCE_FILE}
+            ${TEST_NAME}
+
+            EXTRA_SOURCES
+                src/app/MmsDeviceProbe.cpp
+
+            LIBRARIES
+                ${HEADMOTION_SYNC_TEST_LIBRARIES}
+
+            ${ARGN}
+        )
+
+    endfunction()
+
+
+    # --------------------------------------------------------
+    # Large synthetic sync
+    # --------------------------------------------------------
+
+    headmotion_add_sync_test(
+        headmotion_test_sync_large
+        tests/test_sync_large.cpp
+        sync_large
+
+        LABELS
+            sync
+            integration
+            stress
+
+        TIMEOUT
+            120
+    )
+
+
+    # --------------------------------------------------------
+    # Parallel synthetic sync
+    # --------------------------------------------------------
+
+    headmotion_add_sync_test(
+        headmotion_test_parallel_sync
+        tests/test_parallel_sync.cpp
+        parallel_sync
+
+        LABELS
+            sync
+            parallel
+            integration
+            stress
+
+        TIMEOUT
+            300
+    )
+
+
+    # --------------------------------------------------------
+    # Accel / gyro pairing
+    # --------------------------------------------------------
+
+    headmotion_add_sync_test(
+        headmotion_test_sync_pairing
+        tests/test_sync_pairing.cpp
+        sync_pairing
+
+        LABELS
+            sync
+            unit
+            pairing
+
+        TIMEOUT
+            30
+    )
+
+
+    # --------------------------------------------------------
+    # Queue overflow
+    # --------------------------------------------------------
+
+    headmotion_add_sync_test(
+        headmotion_test_sync_queue_overflow
+        tests/test_sync_queue_overflow.cpp
+        sync_queue_overflow
+
+        LABELS
+            sync
+            unit
+            queue
+            failure
+
+        TIMEOUT
+            30
+    )
+
+
+    # --------------------------------------------------------
+    # Parallel failure isolation
+    # --------------------------------------------------------
+
+    headmotion_add_sync_test(
+        headmotion_test_parallel_failure_isolation
+        tests/test_parallel_failure_isolation.cpp
+        parallel_failure_isolation
+
+        LABELS
+            sync
+            parallel
+            failure
+            integration
+
+        TIMEOUT
+            120
+    )
+
+
+    # --------------------------------------------------------
+    # Filename collision handling
+    # --------------------------------------------------------
+
+    headmotion_add_sync_test(
+        headmotion_test_sync_filename_collision
+        tests/test_sync_filename_collision.cpp
+        sync_filename_collision
+
+        LABELS
+            sync
+            filesystem
+            parallel
+            unit
+
+        TIMEOUT
+            30
+    )
+
+
+    # --------------------------------------------------------
+    # Device ID filename sanitization
+    # --------------------------------------------------------
+
+    headmotion_add_sync_test(
+        headmotion_test_device_id_sanitization
+        tests/test_device_id_sanitization.cpp
+        device_id_sanitization
+
+        LABELS
+            sync
+            unit
+            filesystem
+            security
+
+        TIMEOUT
+            10
+    )
+
+
+    # ========================================================
+    # Protocol tests
+    # ========================================================
+
+    headmotion_add_test_target(
+        headmotion_test_usb_frame_codec
+        tests/test_usb_frame_codec.cpp
+        usb_frame_codec
+
+        LIBRARIES
+            headmotion_protocol
+
+        LABELS
+            protocol
+            usb
+            unit
+
+        TIMEOUT
+            10
+    )
+
+
+    # ========================================================
+    # CommandOutput tests
+    # ========================================================
+
+    headmotion_add_test_target(
+        headmotion_test_command_output_concurrency
+        tests/test_command_output_concurrency.cpp
+        command_output_concurrency
+
+        LIBRARIES
+            Threads::Threads
+
+        LABELS
+            output
+            parallel
+            unit
+            stress
+
+        TIMEOUT
+            120
+    )
+
+
+    # ========================================================
+    # Hardware test helper
+    # ========================================================
+    #
+    # Hardware tests:
+    #   - link against the real application layer
+    #   - return 77 when hardware/configuration is unavailable
+    #   - never run alongside another CTest test
+    #
+    # This prevents separate destructive hardware tests from
+    # fighting over the same physical MMS+.
+    # ========================================================
+
+    function(
+        headmotion_add_hardware_test
+        TARGET_NAME
+        SOURCE_FILE
+        TEST_NAME
+        TIMEOUT_SECONDS
+    )
+
+        headmotion_add_test_target(
+            ${TARGET_NAME}
+            ${SOURCE_FILE}
+            ${TEST_NAME}
+
+            LIBRARIES
+                headmotion_app
+                Threads::Threads
+
+            LABELS
+                hardware
+                ${ARGN}
+
+            TIMEOUT
+                ${TIMEOUT_SECONDS}
+
+            SKIP_RETURN_77
+            RUN_SERIAL
+        )
+
+    endfunction()
+    
+    # ========================================================
+    # Hardware: device scan/discovery
+    #
+    # Non-destructive, but actively probes serial ports.
+    #
+    # Opt in with:
+    #
+    #   HEADMOTION_SCAN_EXPECTED_DEVICES=1
+    #
+    # Optional exact hardware IDs:
+    #
+    #   HEADMOTION_SCAN_EXPECTED_IDS="0561E1,ABC123"
+    # ========================================================
+
+    headmotion_add_test_target(
+        headmotion_test_hardware_scan
+        tests/test_hardware_scan.cpp
+        hardware_scan
+
+        LIBRARIES
+            headmotion_app
+            Threads::Threads
+
+        LABELS
+            hardware
+            scan
+            integration
+
+        TIMEOUT
+            120
+
+        SKIP_RETURN_77
+        RUN_SERIAL
+    )
+
+
+    # ========================================================
+    # Hardware: parallel operations
+    # ========================================================
+
+    headmotion_add_hardware_test(
+        headmotion_test_parallel_operations
+        tests/test_parallel_operations.cpp
+        parallel_operations_hw
+        300
+
+        parallel
+        integration
+    )
+
+
+    # ========================================================
+    # Hardware: single-device E2E
+    # ========================================================
+
+    headmotion_add_hardware_test(
+        headmotion_test_hardware_single_device_e2e
+        tests/test_hardware_single_device_e2e.cpp
+        hardware_single_device_e2e
+        180
+
+        integration
+        e2e
+        destructive
+    )
+
+
+    # ========================================================
+    # Hardware: multi-device sequential E2E
+    #
+    # Devices are tested one at a time.
+    #
+    # Opt in with:
+    #
+    #   HEADMOTION_HW_E2E_PORTS="/dev/serial/by-id/a,/dev/serial/by-id/b"
+    #
+    # This test clears existing recordings.
+    # ========================================================
+
+    headmotion_add_hardware_test(
+        headmotion_test_hardware_multi_device_e2e
+        tests/test_hardware_multi_device_e2e.cpp
+        hardware_multi_device_e2e
+        600
+
+        multi-device
+        integration
+        e2e
+        destructive
+    )
 endif()
+
 
 # ============================================================
 # Installation
