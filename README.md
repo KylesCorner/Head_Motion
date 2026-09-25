@@ -1,57 +1,35 @@
 # HeadMotion USB Client
 
-HeadMotion is a C++ application for controlling and downloading data from an
-MbientLab MetaMotionS / MMS+ sensor over USB.
+HeadMotion is a C++ application for controlling and downloading data from
+MbientLab MetaMotionS / MMS+ sensors over USB.
 
-The project is designed around the MMS+ internal logging workflow. The sensor
-can be configured from a computer, used to record motion internally, and later
-reconnected to download accelerometer, gyroscope, and optional battery data.
+The application is built around the MMS+ internal logging workflow:
+
+1. Connect the sensor over USB.
+2. Configure and start onboard accelerometer/gyroscope logging.
+3. Disconnect the sensor and perform the recording.
+4. Reconnect it later.
+5. Stop recording and download the logged data.
 
 HeadMotion provides two interfaces:
 
-- **HeadMotion GUI** — lightweight FLTK interface for normal recording and
-  download workflows.
-- **`mmsctl` CLI** — command-line interface for development, diagnostics,
-  scripting, and lower-level device operations.
+- **HeadMotion GUI** — the normal interface for recording and downloading data.
+- **`mmsctl` CLI** — command-line control for scripting, diagnostics, and lower-level device access.
 
-## Platform Support
-
-Currently supported:
-
-- Linux x86-64
-
-Planned:
-
-- Windows 11
-
-## Features
-
-- MMS+ USB serial discovery and verification
-- Saved default device selection
-- Stable device matching using USB metadata
-- Manual `--port` override
-- MetaWear SDK communication over USB
-- Internal accelerometer logging
-- Internal gyroscope logging
-- Optional battery-state logging
-- Configurable IMU sample rates
-- Recording start, stop, reset, and download operations
-- FLTK graphical interface
-- Command-line diagnostic tools
-- Download progress reporting
-- Collision-free CSV filenames
-- Portable Linux AppImage distribution
+For source builds, testing, packaging, and development setup, see
+[DEVELOPMENT.md](DEVELOPMENT.md).
 
 ---
 
-# Installation
+## Installation
 
-## Linux AppImage
+Prebuilt releases are available from:
 
-For normal use, the recommended installation method is the prebuilt AppImage
-available from the GitHub Releases page.
+https://github.com/KylesCorner/Head_Motion/releases
 
-Download the latest:
+### Linux x86-64
+
+Download the latest Linux AppImage:
 
 ```text
 HeadMotion-<version>-Linux.AppImage
@@ -69,347 +47,224 @@ Run it:
 ./HeadMotion-*-Linux.AppImage
 ```
 
-The AppImage is portable and does not require the HeadMotion source tree,
-CMake, Ninja, FLTK development packages, or the MetaWear SDK source.
+The AppImage contains the application and its runtime dependencies. A source
+checkout, compiler, CMake, FLTK development packages, and MetaWear SDK source
+are not required for normal use.
 
----
+### Linux serial permissions
 
-# Developer Build
-
-Developers can build HeadMotion from source using the included Makefile.
-
-The developer build produces:
-
-```text
-mmsctl
-headmotion_gui
-```
-
-## 1. Install dependencies
-
-### Arch Linux
-
-```bash
-sudo pacman -S base-devel cmake ninja git fltk
-```
-
-### Debian / Ubuntu
-
-```bash
-sudo apt install \
-    build-essential \
-    cmake \
-    ninja-build \
-    git \
-    libfltk1.3-dev
-```
-
-## 2. Clone HeadMotion
-
-```bash
-git clone https://github.com/KylesCorner/Head_Motion.git
-cd Head_Motion
-```
-
-## 3. Install the MetaWear SDK
-
-Clone the MetaWear C++ SDK into the `external` directory:
-
-```bash
-mkdir -p external
-
-git clone https://github.com/mbientlab/MetaWear-SDK-Cpp.git \
-    external/MetaWear-SDK-Cpp
-```
-
-Initialize its submodules:
-
-```bash
-cd external/MetaWear-SDK-Cpp
-git submodule update --init --recursive
-cd ../..
-```
-
-The repository should now look approximately like:
-
-```text
-Head_Motion/
-├── external/
-│   └── MetaWear-SDK-Cpp/
-├── include/
-├── packaging/
-├── src/
-├── CMakeLists.txt
-└── Makefile
-```
-
-## 4. Build Debug
-
-```bash
-make debug
-```
-
-The Debug executables are created at:
-
-```text
-build/linux-native-debug/mmsctl
-build/linux-native-debug/headmotion_gui
-```
-
-Run the GUI:
-
-```bash
-make run-gui-debug
-```
-
-## 5. Build Release
-
-```bash
-make release
-```
-
-The optimized Release executables are created at:
-
-```text
-build/linux-native-release/mmsctl
-build/linux-native-release/headmotion_gui
-```
-
-Run the Release GUI:
-
-```bash
-make run-gui-release
-```
-
----
-
-# Makefile Commands
-
-The included Makefile provides shortcuts for normal development tasks.
-
-| Command | Description |
-| --- | --- |
-| `make debug` | Configure and build the Debug version |
-| `make release` | Configure and build the Release version |
-| `make rebuild-debug` | Clean and rebuild Debug |
-| `make rebuild-release` | Clean and rebuild Release |
-| `make run-gui-debug` | Build and launch the Debug GUI |
-| `make run-gui-release` | Build and launch the Release GUI |
-| `make test-debug` | Build and run Debug tests |
-| `make test-release` | Build and run Release tests |
-| `make appimage` | Build Release and create the Linux AppImage |
-| `make clean-debug` | Clean the Debug build |
-| `make clean-release` | Clean the Release build |
-| `make clean` | Clean both builds |
-| `make distclean` | Remove the entire `build/` directory |
-| `make help` | Show available Makefile commands |
-
----
-
-# Building the AppImage
-
-Create a distributable Linux AppImage with:
-
-```bash
-make appimage
-```
-
-This automatically:
-
-1. Configures the Release build.
-2. Builds HeadMotion in Release mode.
-3. Clears the previous CPack staging directory.
-4. Runs the AppImage CPack generator.
-
-The finished AppImage is written to:
-
-```text
-build/linux-native-release/
-```
-
-For example:
-
-```text
-build/linux-native-release/HeadMotion-0.1.0-Linux.AppImage
-```
-
-That file can be distributed directly to Linux users.
-
----
-
-# Serial Permissions
-
-The MMS+ normally appears as a device such as:
+The MMS+ normally appears as a serial device such as:
 
 ```text
 /dev/ttyACM0
 ```
 
-Your user account must have permission to access the serial device.
+Your user account must have permission to access the serial port.
 
-## Arch Linux
+On Arch Linux:
 
 ```bash
 sudo usermod -aG uucp "$USER"
 ```
 
-## Debian / Ubuntu
+On Debian/Ubuntu:
 
 ```bash
 sudo usermod -aG dialout "$USER"
 ```
 
-Log out and log back in after changing group membership.
+Log out and back in after changing group membership.
 
-You can verify the device with:
+Verify that the device is present with:
 
 ```bash
 ls -l /dev/ttyACM*
 ```
 
----
+### Windows 11 x64
 
-# Typical Use Cases
+Download the Windows x64 executable/installer from the GitHub Releases page and
+run it normally.
 
-| Use case | Interface | Example |
-| --- | --- | --- |
-| Record a motion session | GUI | Scan → Reset → Start → Stop → Download |
-| Download an existing recording | GUI | Scan → Select output directory → Download |
-| Select an IMU sample rate | GUI | Choose rate before starting recording |
-| Verify the connected MMS+ | CLI | `make run-scan` |
-| Read device identity | CLI | `make run-identify PORT=/dev/ttyACM0` |
-| Start a test recording | CLI | `make run-record-start PORT=/dev/ttyACM0 RATE=200` |
-| Stop a test recording | CLI | `make run-record-stop PORT=/dev/ttyACM0` |
-| Download a test recording | CLI | `make run-sync PORT=/dev/ttyACM0 OUT=data/session_001` |
-| Clear logger state | CLI | `make run-record-reset PORT=/dev/ttyACM0` |
-| Build a portable release | Developer | `make appimage` |
+The MMS+ appears as a Windows COM device. HeadMotion uses the native Windows
+serial backend and does not require a Linux compatibility layer.
+
+### Building from source
+
+Source builds are documented separately in:
+
+[DEVELOPMENT.md](DEVELOPMENT.md)
 
 ---
 
-# GUI Recording Workflow
+## GUI Quick Start
 
-A typical recording session can be performed entirely from the graphical
-application.
+A normal recording session can be completed entirely from the GUI.
 
-Launch the Debug GUI:
+1. Connect one or more MMS+ sensors over USB.
+2. Click **Scan**.
+3. Click **Reset** or **Reset All** before beginning a fresh recording.
+4. Choose the desired sample rate.
+5. Click **Start** or **Record Start All**.
+6. Perform the recording.
+7. Reconnect the sensor if it was disconnected during the session.
+8. Click **Stop** or **Record Stop All**.
+9. Choose an output directory.
+10. Enable **Legacy CSV** if the long-format IMU CSV is also required.
+11. Click **Sync** or **Sync All**.
 
-```bash
-make run-gui-debug
-```
+The GUI displays per-device state and aggregate download progress while data is
+transferred from onboard flash.
 
-or the optimized Release GUI:
-
-```bash
-make run-gui-release
-```
-
-Then:
-
-1. Connect the MMS+ over USB.
-2. Select **Scan Device**.
-3. Choose the desired sample rate.
-4. Select **Reset Loggers**.
-5. Select **Start Recording**.
-6. Perform the motion experiment.
-7. Select **Stop Recording**.
-8. Choose an output directory.
-9. Select **Download Recording**.
-
-The GUI displays download progress while logger entries are transferred from
-the MMS+ and the CSV files are finalized.
+> **Important:** Resetting a recording clears the existing logger state. Sync
+> any data you need before starting a fresh session.
 
 ---
 
-# CLI Development Workflow
+## Command-Line Usage
 
-The Makefile also provides wrappers around the most common `mmsctl` commands.
+The CLI executable is named:
 
-## Scan for the MMS+
-
-```bash
-make run-scan
+```text
+mmsctl
 ```
 
-The scan command discovers and verifies the MMS+ and saves it as the default
-device.
+Examples below assume `mmsctl` is on your `PATH`. For a development build, the
+Linux Debug executable is normally:
 
-## Identify a device
-
-```bash
-make run-identify PORT=/dev/ttyACM0
+```text
+./build/linux-native-debug/mmsctl
 ```
 
-## Reset existing loggers
+### Scan for devices
 
 ```bash
-make run-record-reset PORT=/dev/ttyACM0
+mmsctl scan
 ```
 
-Allow the board a few seconds to finish resetting before starting a new
-recording.
+### Identify a device
 
-## Start recording
-
-At the default 50 Hz:
+By serial port:
 
 ```bash
-make run-record-start PORT=/dev/ttyACM0
+mmsctl identify --port /dev/ttyACM0
 ```
+
+By MMS+ device ID:
+
+```bash
+mmsctl identify --device-id 056D8D
+```
+
+### Reset recording state
+
+```bash
+mmsctl record-reset --port /dev/ttyACM0
+```
+
+### Start recording
 
 At 200 Hz:
 
 ```bash
-make run-record-start \
-    PORT=/dev/ttyACM0 \
-    RATE=200
+mmsctl record-start \
+    --port /dev/ttyACM0 \
+    --rate 200
 ```
 
-## Stop recording
+With battery logging every 60 seconds:
 
 ```bash
-make run-record-stop PORT=/dev/ttyACM0
+mmsctl record-start \
+    --port /dev/ttyACM0 \
+    --rate 200 \
+    --battery-interval 60
 ```
 
-## Download recording
+### Stop recording
 
 ```bash
-make run-sync \
-    PORT=/dev/ttyACM0 \
-    OUT=data/session_001
+mmsctl record-stop --port /dev/ttyACM0
 ```
 
-The resulting IMU data is written under:
+### Download a recording
 
-```text
-data/session_001/
+```bash
+mmsctl sync \
+    --port /dev/ttyACM0 \
+    --out data/session_001
+```
+
+By default, sync writes the Xsens-style IMU CSV.
+
+To also write the legacy long-format IMU CSV:
+
+```bash
+mmsctl sync \
+    --port /dev/ttyACM0 \
+    --out data/session_001 \
+    --imu-csv
+```
+
+### JSON output
+
+Commands that support normal CLI output can also emit machine-readable JSON:
+
+```bash
+mmsctl scan --json
+```
+
+```bash
+mmsctl record-start \
+    --port /dev/ttyACM0 \
+    --rate 1600 \
+    --json
 ```
 
 ---
 
-# Direct `mmsctl` Usage
+## CLI Command Reference
 
-The CLI can also be invoked directly.
+| Command | Purpose |
+| --- | --- |
+| `scan` | Discover and verify connected MMS+ devices |
+| `identify` | Read device identity information |
+| `module-info` | Read MetaWear module information |
+| `sdk-probe` | Test MetaWear SDK initialization |
+| `record-reset` | Clear existing logger configuration before a fresh recording |
+| `record-start` | Configure sensors and start internal logging |
+| `record-stop` | Stop sensor sampling and internal logging |
+| `sync` | Download logged data to CSV |
+| `cmd` | Send a MetaWear command payload through USB framing |
+| `tx-raw` | Send a complete raw USB frame |
 
-General format:
+Common device selectors:
 
 ```text
-mmsctl <command> [options]
+--port <serial-port>
+--device-id <device-id>
 ```
 
-| Command | Usage | Description |
-| --- | --- | --- |
-| `scan` | `mmsctl scan` | Discover, verify, and save the default MMS+ |
-| `identify` | `mmsctl identify [--port PORT]` | Read device identity information |
-| `module-info` | `mmsctl module-info [--port PORT]` | Read MetaWear module information |
-| `sdk-probe` | `mmsctl sdk-probe [--port PORT]` | Test MetaWear SDK initialization |
-| `tx-raw` | `mmsctl tx-raw [--port PORT] HEX` | Send a complete raw USB frame |
-| `cmd` | `mmsctl cmd [--port PORT] PAYLOAD` | Send a MetaWear payload using USB framing |
-| `record-reset` | `mmsctl record-reset [--port PORT]` | Clear existing logger configuration |
-| `record-start` | `mmsctl record-start [--port PORT] [--rate HZ] [--battery-interval SECONDS]` | Start internal recording |
-| `record-stop` | `mmsctl record-stop [--port PORT]` | Stop sampling and logging |
-| `sync` | `mmsctl sync [--port PORT] [--out DIRECTORY]` | Download logged data |
+Common output options:
 
-Supported sample rates:
+```text
+--json
+--quiet
+```
+
+Sync options:
+
+```text
+--out <directory>
+--output-dir <directory>
+--imu-csv
+```
+
+---
+
+## Sample Rates
+
+`record-start --rate` accepts:
 
 ```text
 25
@@ -419,195 +274,157 @@ Supported sample rates:
 400
 800
 1600
-3200 Hz
+3200
 ```
 
-The default sample rate is:
+The MetaMotionS uses a Bosch BMI270 IMU. The accelerometer and gyroscope do not
+have identical maximum ODRs:
 
-```text
-50 Hz
-```
+| Sensor | Maximum BMI270 ODR used by HeadMotion |
+| --- | ---: |
+| Accelerometer | 1600 Hz |
+| Gyroscope | 3200 Hz |
 
-Battery logging is disabled unless `--battery-interval` is provided.
+A request for `--rate 3200` therefore requests 3200 Hz from the gyroscope while
+the accelerometer is limited to 1600 Hz.
+
+The 1600 Hz recording path has been tested on MMS+ hardware. The 3200 Hz gyro
+mode should currently be treated as experimental and validated for the specific
+recording workflow before relying on it for production data.
+
+Higher sample rates also consume onboard logger storage much faster.
 
 ---
 
-# Device Discovery
+## Output Files
 
-HeadMotion can save a verified MMS+ as the default device.
+HeadMotion uses the MMS+ hardware/device ID in output filenames.
 
-Using the Makefile:
+### Default IMU CSV
 
-```bash
-make run-scan
-```
-
-or directly:
-
-```bash
-./build/linux-native-debug/mmsctl scan
-```
-
-The saved device record is stored at:
+A normal sync writes:
 
 ```text
-data/latest_device_port.bin
+imu_<DEVICE_ID>.csv
 ```
 
-Once a device has been saved, `mmsctl` commands can resolve it automatically.
-
-An explicit serial port can still be provided when required:
-
-```bash
-./build/linux-native-debug/mmsctl identify \
-    --port /dev/ttyACM0
-```
-
----
-
-# Battery Logging
-
-Battery logging can be enabled using the direct `mmsctl` interface.
-
-Reset the loggers:
-
-```bash
-./build/linux-native-debug/mmsctl record-reset
-sleep 3
-```
-
-Start IMU logging at 25 Hz and battery logging every 60 seconds:
-
-```bash
-./build/linux-native-debug/mmsctl record-start \
-    --rate 25 \
-    --battery-interval 60
-```
-
-Stop recording:
-
-```bash
-./build/linux-native-debug/mmsctl record-stop
-```
-
-Download:
-
-```bash
-./build/linux-native-debug/mmsctl sync \
-    --out data/battery_test_001
-```
-
-This produces:
+This is the Xsens-style combined accelerometer/gyroscope output:
 
 ```text
-data/battery_test_001/
-├── imu.csv
-└── battery.csv
+PacketCounter,SampleTimeFine,Euler_X,Euler_Y,Euler_Z,Acc_X,Acc_Y,Acc_Z,Gyr_X,Gyr_Y,Gyr_Z,elapsed_ms,utc_timestamp
 ```
 
----
+### Legacy IMU CSV
 
-# Output Data
-
-## IMU CSV
-
-The IMU CSV format is:
+When **Legacy CSV** is enabled in the GUI, or `--imu-csv` is passed to
+`mmsctl sync`, HeadMotion also writes:
 
 ```text
-epoch_ms,sensor,x,y,z
+imu_legacy_<DEVICE_ID>.csv
 ```
 
-Example:
+Format:
 
 ```text
-1786651094161,accel_g,0.409790,-0.911499,0.207886
-1786651094165,accel_g,0.411743,-0.927856,0.207153
-1786651094161,gyro_dps,2.136,-0.427,1.282
+epoch_ms,elapsed_ms,sensor,x,y,z
 ```
 
-The `sensor` field identifies the measurement type:
+The `sensor` field is either:
 
 ```text
 accel_g
 gyro_dps
 ```
 
-## Battery CSV
+This format preserves accelerometer and gyroscope samples independently and is
+useful for sample-rate validation and low-level analysis.
 
-When battery logging is enabled:
+### Battery CSV
 
-```text
-epoch_ms,voltage_mv,charge_percent
-```
-
-Example:
+If battery logging was enabled when the recording started, sync also writes:
 
 ```text
-1786651094161,4181,100
+battery_<DEVICE_ID>.csv
 ```
+
+Format:
+
+```text
+epoch_ms,elapsed_ms,voltage_mv,charge_percent
+```
+
+### Existing files
+
+HeadMotion does not overwrite an existing recording. If a filename already
+exists, a numeric suffix is added:
+
+```text
+imu_056D8D.csv
+imu_056D8D_1.csv
+imu_056D8D_2.csv
+```
+
+The corresponding legacy and battery files use the same collision-avoidance
+scheme.
 
 ---
 
-# Data Integrity
+## Compatibility
 
-HeadMotion avoids overwriting previous recording downloads.
+### Hardware
 
-If an output directory already contains:
+| Hardware | Status |
+| --- | --- |
+| MbientLab MetaMotionS / MMS+ | Supported |
+| BMI270 accelerometer + gyroscope | Supported |
+| Other MetaWear boards | Not currently guaranteed |
+
+HeadMotion is specifically designed around the MMS+ USB CDC transport and its
+internal logging workflow.
+
+### Operating systems
+
+| Platform | Status | Notes |
+| --- | --- | --- |
+| Linux x86-64 | Supported | AppImage and native source builds |
+| Windows 11 x64 | Supported | Native Windows serial backend |
+| macOS | Not supported | Native macOS serial backend is not implemented |
+
+### Serial transport
+
+The default and supported backend is:
 
 ```text
-imu.csv
+native
 ```
 
-the next download uses:
-
-```text
-imu_1.csv
-```
-
-followed by:
-
-```text
-imu_2.csv
-imu_3.csv
-...
-```
-
-Battery files use the corresponding index:
-
-```text
-battery.csv
-battery_1.csv
-battery_2.csv
-...
-```
-
-CSV streams are opened in append mode as an additional safeguard against
-accidental truncation.
+The `libserialport` backend is present as a build option but is not currently
+wired up.
 
 ---
 
-# Project Structure
+## Multi-Device Operation
 
-HeadMotion separates high-level application behavior from the USB protocol and
-platform-specific serial implementation.
+The GUI can discover and operate multiple MMS+ sensors.
 
-```text
-src/
-├── app/            Application commands
-├── gui/            FLTK graphical interface
-├── metawear/       MetaWear USB transport
-├── platform/       OS-specific serial implementations
-├── protocol/       MMS+ USB framing
-├── sdk/            MetaWear SDK bridge
-├── session/        Persistent device/session state
-└── util/           Portable utilities
-```
+Each device is tracked using its MMS+ device ID and serial port. Recording,
+stopping, resetting, and syncing can be run per-device or across all detected
+devices.
 
-This structure allows additional platform backends, including Windows, to be
-added without changing the higher-level recording workflow.
+Output filenames include the device ID so recordings from multiple sensors can
+share the same output directory without colliding.
 
 ---
 
-# License
+## Development
+
+Source builds, dependency installation, tests, Windows cross-compilation, Wine
+smoke testing, and AppImage packaging are documented in:
+
+[DEVELOPMENT.md](DEVELOPMENT.md)
+
+---
+
+## License
 
 To be added.
