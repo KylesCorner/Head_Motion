@@ -8,6 +8,7 @@
 #include <FL/Fl_Box.H>
 #include <FL/Fl_Button.H>
 #include <FL/Fl_Choice.H>
+#include <FL/Fl_Check_Button.H>
 #include <FL/Fl_Double_Window.H>
 #include <FL/Fl_Input.H>
 #include <FL/Fl_Native_File_Chooser.H>
@@ -42,7 +43,10 @@ constexpr std::array SAMPLE_RATES = {
     SampleRateOption{25.0f,  "25 Hz"},
     SampleRateOption{50.0f,  "50 Hz"},
     SampleRateOption{100.0f, "100 Hz"},
-    SampleRateOption{200.0f, "200 Hz"}
+    SampleRateOption{200.0f, "200 Hz"},
+    SampleRateOption{400.0f, "400 Hz"},
+    SampleRateOption{800.0f, "800 Hz"},
+    SampleRateOption{1600.0f, "1600 Hz"},
 };
 
 constexpr int DEFAULT_SAMPLE_RATE_INDEX = 1;
@@ -531,6 +535,20 @@ void MainWindow::buildUi() {
         98,
         FILTER_ROW_H,
         "Browse..."
+    );
+
+    legacy_imu_csv_checkbox_ = new Fl_Check_Button(
+        browse_button_->x() + browse_button_->w() + 8,
+        FILTER_ROW_Y,
+        WINDOW_W -
+            (browse_button_->x() + browse_button_->w() + 8) -
+            MARGIN,
+        FILTER_ROW_H,
+        "Legacy CSV"
+    );
+    legacy_imu_csv_checkbox_->value(0);
+    legacy_imu_csv_checkbox_->tooltip(
+        "Also write the legacy long-format IMU CSV during sync"
     );
 
     device_count_box_ = new Fl_Box(
@@ -1421,6 +1439,10 @@ void MainWindow::runSyncAll() {
 
     const std::string base_output = outputDirectory();
 
+    const bool write_legacy_imu_csv =
+        legacy_imu_csv_checkbox_ != nullptr &&
+        legacy_imu_csv_checkbox_->value() != 0;
+
     if (base_output.empty()) {
         setStatus("Choose an output directory first");
         return;
@@ -1442,11 +1464,14 @@ void MainWindow::runSyncAll() {
         idleDeviceSnapshot(),
         "sync",
         "Sync",
-        [base_output](const DevicePtr& current, headmotion::app::CommandOutput& output) {
+        [base_output, write_legacy_imu_csv](
+            const DevicePtr& current,
+            headmotion::app::CommandOutput& output
+        ) {
             return headmotion::app::runSyncCommand(
                 current->port,
                 base_output,
-                false,
+                write_legacy_imu_csv,
                 output
             );
         }
@@ -1558,6 +1583,10 @@ void MainWindow::runSyncOne(
 
     const std::string base_output = outputDirectory();
 
+    const bool write_legacy_imu_csv =
+        legacy_imu_csv_checkbox_ != nullptr &&
+        legacy_imu_csv_checkbox_->value() != 0;
+
     if (base_output.empty()) {
         setStatus("Choose an output directory first");
         return;
@@ -1579,11 +1608,14 @@ void MainWindow::runSyncOne(
         device,
         "sync",
         "Sync",
-        [base_output](const DevicePtr& current, headmotion::app::CommandOutput& output) {
+        [base_output, write_legacy_imu_csv](
+            const DevicePtr& current,
+            headmotion::app::CommandOutput& output
+        ) {
             return headmotion::app::runSyncCommand(
                 current->port,
                 base_output,
-                false,
+                write_legacy_imu_csv,
                 output
             );
         }
@@ -1816,11 +1848,13 @@ void MainWindow::setControlsEnabled() {
         sample_rate_choice_->activate();
         browse_button_->activate();
         output_input_->activate();
+        legacy_imu_csv_checkbox_->activate();
     }
     else {
         sample_rate_choice_->deactivate();
         browse_button_->deactivate();
         output_input_->deactivate();
+        legacy_imu_csv_checkbox_->deactivate();
     }
 
     std::ostringstream devices_label;

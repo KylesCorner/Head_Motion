@@ -51,6 +51,10 @@ std::string lowerCopy(std::string value) {
 
 } // namespace
 
+void populateUsbMetadata(
+    headmotion::transport::SerialPortInfo& info
+);
+
 std::vector<headmotion::transport::SerialPortInfo> LinuxSerialDiscovery::listPorts() const {
     std::vector<headmotion::transport::SerialPortInfo> out;
 
@@ -73,6 +77,12 @@ std::vector<headmotion::transport::SerialPortInfo> LinuxSerialDiscovery::listPor
         if (seen_paths.insert(key).second) {
             out.push_back(std::move(info));
         }
+    }
+
+    for (auto& info : out) {
+        populateUsbMetadata(
+            info
+        );
     }
 
     std::sort(

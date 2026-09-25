@@ -42,6 +42,7 @@ extern "C" {
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <vector>
 
 namespace headmotion::app {
 
@@ -309,6 +310,81 @@ MblMwGyroBoschOdr gyroOdrFromRate(
     throw std::runtime_error(
         "Unsupported sample rate. Use one of: "
         "25, 50, 100, 200, 400, 800, 1600, 3200 Hz"
+    );
+}
+
+/*
+ * MetaWear-SDK-Cpp currently writes the BMI270 gyro configuration using the
+ * shared Bosch gyro config structure, which does not model the BMI270
+ * gyr_filter_perf bit (GYR_CONF bit 7).
+ *
+ * On MMS+ hardware this leaves the register at, for example, 0x2C for a
+ * requested 1600 Hz ODR.  The ODR nibble is correct, but the gyro remains
+ * near 200 Hz.  Setting gyr_filter_perf changes that byte to 0xAC and allows
+ * the gyro to operate at the requested high ODR.
+ *
+ * We only override rates above 200 Hz so the established low-rate behavior
+ * remains unchanged.
+ */
+void applyBmi270GyroPerformanceMode(
+    headmotion::metawear::MetaWearUsbTransport& usb,
+    float sample_rate_hz,
+    CommandOutput& output
+) {
+    if (sample_rate_hz <= 200.0f) {
+        return;
+    }
+
+    constexpr std::uint8_t GYRO_MODULE = 0x13;
+    constexpr std::uint8_t GYRO_CONFIG_REGISTER = 0x03;
+    constexpr std::uint8_t GYR_FILTER_PERF = 0x80;
+    constexpr std::uint8_t GYR_BWP_NORMAL = 0x20;
+
+    const MblMwGyroBoschOdr odr =
+        gyroOdrFromRate(
+            sample_rate_hz
+        );
+
+    const std::uint8_t config_byte_0 =
+        static_cast<std::uint8_t>(
+            GYR_FILTER_PERF |
+            GYR_BWP_NORMAL |
+            static_cast<std::uint8_t>(odr)
+        );
+
+    const std::uint8_t config_byte_1 =
+        static_cast<std::uint8_t>(
+            MBL_MW_GYRO_BOSCH_RANGE_500dps
+        );
+
+    usb.writePayload(
+        std::vector<std::uint8_t>{
+            GYRO_MODULE,
+            GYRO_CONFIG_REGISTER,
+            config_byte_0,
+            config_byte_1
+        }
+    );
+
+    output.event(
+        "gyro_config_override",
+        {
+            {"model", "BMI270"},
+            {"filter_performance", true},
+            {"sample_rate_hz", sample_rate_hz},
+            {
+                "config_byte_0",
+                static_cast<std::uint64_t>(
+                    config_byte_0
+                )
+            },
+            {
+                "config_byte_1",
+                static_cast<std::uint64_t>(
+                    config_byte_1
+                )
+            }
+        }
     );
 }
 
@@ -1044,9 +1120,20 @@ int runRecordStartCommand(
         }
     );
 
-    mbl_mw_acc_set_odr(
-        board,
-        sample_rate_hz
+    const float actual_accel_hz =
+        mbl_mw_acc_set_odr(
+            board,
+            sample_rate_hz
+        );
+
+    output.event(
+        "sensor_config",
+        {
+            {"sensor", "accelerometer"},
+            {"requested_sample_rate_hz", sample_rate_hz},
+            {"actual_sample_rate_hz", actual_accel_hz},
+            {"range_g", 4.0}
+        }
     );
 
     mbl_mw_acc_set_range(
@@ -1092,6 +1179,27 @@ int runRecordStartCommand(
         bridge,
         250
     );
+
+    if (gyro_impl == GyroImpl::Bmi270) {
+        output.status(
+            "applying_bmi270_gyro_performance_mode"
+        );
+
+        applyBmi270GyroPerformanceMode(
+            usb,
+            sample_rate_hz,
+            output
+        );
+
+        /*
+         * The register write is fire-and-forget.  Give the board a short
+         * settling interval before logger routes are created.
+         */
+        pumpFor(
+            bridge,
+            250
+        );
+    }
 
     MblMwDataSignal* accel_signal =
         mbl_mw_acc_get_acceleration_data_signal(

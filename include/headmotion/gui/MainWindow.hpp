@@ -12,6 +12,7 @@
 
 class Fl_Box;
 class Fl_Button;
+class Fl_Check_Button;
 class Fl_Choice;
 class Fl_Double_Window;
 class Fl_Input;
@@ -177,6 +178,7 @@ private:
     Fl_Choice* sample_rate_choice_ = nullptr;
     Fl_Input* output_input_ = nullptr;
     Fl_Button* browse_button_ = nullptr;
+    Fl_Check_Button* legacy_imu_csv_checkbox_ = nullptr;
 
     Fl_Box* device_count_box_ = nullptr;
 
